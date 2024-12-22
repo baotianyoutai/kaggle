@@ -1,1 +1,1141 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.10.14","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"none","dataSources":[{"sourceId":84493,"databundleVersionId":9871156,"sourceType":"competition"}],"dockerImageVersionId":30786,"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":false}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"markdown","source":"# Libraries","metadata":{}},{"cell_type":"code","source":"import pandas as pd\nimport polars as pl\nimport numpy as np\nimport gc\nfrom matplotlib import pyplot as plt\nimport matplotlib.cm as cm\nfrom sklearn.model_selection import StratifiedGroupKFold","metadata":{"execution":{"iopub.status.busy":"2024-12-22T17:12:41.841305Z","iopub.execute_input":"2024-12-22T17:12:41.843229Z","iopub.status.idle":"2024-12-22T17:12:45.467240Z","shell.execute_reply.started":"2024-12-22T17:12:41.843117Z","shell.execute_reply":"2024-12-22T17:12:45.465488Z"},"trusted":true},"outputs":[],"execution_count":1},{"cell_type":"markdown","source":"# Configurations","metadata":{}},{"cell_type":"code","source":"class CONFIG:\n    target_col = \"responder_6\"\n    lag_cols_original = [\"date_id\", \"symbol_id\"] + [f\"responder_{idx}\" for idx in range(9)]\n    lag_cols_rename = { f\"responder_{idx}\" : f\"responder_{idx}_lag_1\" for idx in range(9)}\n    valid_ratio = 0.05\n    start_dt = 1100","metadata":{"execution":{"iopub.status.busy":"2024-12-22T17:12:45.470123Z","iopub.execute_input":"2024-12-22T17:12:45.470833Z","iopub.status.idle":"2024-12-22T17:12:45.481392Z","shell.execute_reply.started":"2024-12-22T17:12:45.470786Z","shell.execute_reply":"2024-12-22T17:12:45.479622Z"},"trusted":true},"outputs":[],"execution_count":2},{"cell_type":"markdown","source":"# Load training data","metadata":{}},{"cell_type":"code","source":"# Use last 2 parquets\ntrain = pl.scan_parquet(\n    f\"/kaggle/input/jane-street-real-time-market-data-forecasting/train.parquet\"\n).select(\n    pl.int_range(pl.len(), dtype=pl.UInt32).alias(\"id\"),\n    pl.all(),\n).with_columns(\n    (pl.col(CONFIG.target_col)*2).cast(pl.Int32).alias(\"label\"),\n).filter(\n    pl.col(\"date_id\").gt(CONFIG.start_dt)\n)","metadata":{"execution":{"iopub.status.busy":"2024-12-22T17:12:45.483461Z","iopub.execute_input":"2024-12-22T17:12:45.484041Z","iopub.status.idle":"2024-12-22T17:12:45.542940Z","shell.execute_reply.started":"2024-12-22T17:12:45.483985Z","shell.execute_reply":"2024-12-22T17:12:45.541327Z"},"trusted":true},"outputs":[],"execution_count":3},{"cell_type":"markdown","source":"１\n\npl.scan_parquet(...): Parquetファイルを読み込むための関数ですが、read_parquet と異なり、データをメモリに読み込まずにスキャンします。これは、非常に大きなファイルを扱う場合にメモリ効率を高めるための方法です。データは必要に応じて後から読み込まれます（遅延評価）。\n\n２\n\n.select(...): 読み込む列を選択します。\npl.int_range(pl.len(), dtype=pl.UInt32).alias(\"id\"): 新しい列 id を作成します。\npl.len(): データフレームの行数を取得します。\npl.int_range(...): 0 から行数までの整数のシーケンスを生成します。つまり、各行に一意のIDを付与します。\ndtype=pl.UInt32: 生成する整数のデータ型を符号なし32ビット整数 (UInt32) に指定します。これにより、メモリ使用量を抑えることができます。\n.alias(\"id\"): 生成された列に id という名前を付けます。\npl.all(): 他のすべての列も選択します。つまり、元のParquetファイルに含まれるすべての列も読み込みます。\n\n３\n\n.with_columns(...): 新しい列を追加または既存の列を変換します。\n(pl.col(CONFIG.target_col)*2).cast(pl.Int32).alias(\"label\"): 新しい列 label を作成します。\nCONFIG.target_col: 予測対象の列名が格納されている変数です。例えば、\"responder_6\" などが格納されていると想定されます。\npl.col(CONFIG.target_col): 指定された列を選択します。\n*2: 選択された列の値を2倍にします。\n.cast(pl.Int32): 結果を符号付き32ビット整数 (Int32) に型変換します。\n.alias(\"label\"): 結果の列に label という名前を付けます。\n\n\n４\n\n.filter(...): 指定された条件でデータをフィルタリングします。\npl.col(\"date_id\").gt(CONFIG.start_dt): date_id 列の値が CONFIG.start_dt より大きい行のみを選択します。CONFIG.start_dt は、データを使用する開始日を表す変数です。これにより、特定の期間以降のデータのみを使用するようにフィルタリングできます。\n\nまとめ\n\nまとめ\n\nこのコードは、大きなParquetファイルを効率的に読み込み、以下の処理を行っています。\n\n各行に一意のID (id) を付与。\n予測対象の列 (CONFIG.target_col) の値を2倍にして label 列として追加。\n指定された開始日 (CONFIG.start_dt) 以降のデータのみを抽出。\nscan_parquet を使用しているため、データはまだメモリに読み込まれていません。後続の処理で .collect() を呼び出すことで、データがメモリに読み込まれ、DataFrameとして操作できるようになります。この遅延評価により、メモリ使用量を大幅に削減できます。","metadata":{}},{"cell_type":"markdown","source":"# Create Lags data from training data","metadata":{}},{"cell_type":"code","source":"lags = train.select(pl.col(CONFIG.lag_cols_original))\nlags = lags.rename(CONFIG.lag_cols_rename)\nlags = lags.with_columns(\n    date_id = pl.col('date_id') + 1,  # lagged by 1 day\n    )\nlags = lags.group_by([\"date_id\", \"symbol_id\"], maintain_order=True).last()  # pick up last record of previous date\nlags","metadata":{"execution":{"iopub.status.busy":"2024-12-22T17:12:45.544647Z","iopub.execute_input":"2024-12-22T17:12:45.545090Z","iopub.status.idle":"2024-12-22T17:12:45.949008Z","shell.execute_reply.started":"2024-12-22T17:12:45.545045Z","shell.execute_reply":"2024-12-22T17:12:45.947350Z"},"trusted":true},"outputs":[{"execution_count":4,"output_type":"execute_result","data":{"text/plain":"<LazyFrame at 0x7AE8735F0100>","text/html":"<h4>NAIVE QUERY PLAN</h4><p>run <b>LazyFrame.show_graph()</b> to see the optimized version</p><?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<!-- Generated by graphviz version 12.0.0 (20240803.0821)\n -->\n<!-- Title: polars_query Pages: 1 -->\n<svg width=\"2108pt\" height=\"578pt\"\n viewBox=\"0.00 0.00 2107.50 578.25\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n<g id=\"graph0\" class=\"graph\" transform=\"scale(1 1) rotate(0) translate(4 574.25)\">\n<title>polars_query</title>\n<polygon fill=\"white\" stroke=\"none\" points=\"-4,4 -4,-574.25 2103.5,-574.25 2103.5,4 -4,4\"/>\n<!-- p1 -->\n<g id=\"node1\" class=\"node\">\n<title>p1</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"2099.5,-570.25 0,-570.25 0,-510.5 2099.5,-510.5 2099.5,-570.25\"/>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-552.95\" font-family=\"Times,serif\" font-size=\"14.00\">AGG [col(&quot;responder_0_lag_1&quot;).last(), col(&quot;responder_1_lag_1&quot;).last(), col(&quot;responder_2_lag_1&quot;).last(), col(&quot;responder_3_lag_1&quot;).last(), col(&quot;responder_4_lag_1&quot;).last(), col(&quot;responder_5_lag_1&quot;).last(), col(&quot;responder_6_lag_1&quot;).last(), col(&quot;responder_7_lag_1&quot;).last(), col(&quot;responder_8_lag_1&quot;).last()]</text>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-535.7\" font-family=\"Times,serif\" font-size=\"14.00\">BY</text>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-518.45\" font-family=\"Times,serif\" font-size=\"14.00\">[col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n</g>\n<!-- p2 -->\n<g id=\"node2\" class=\"node\">\n<title>p2</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1262.12,-474.5 837.38,-474.5 837.38,-438.5 1262.12,-438.5 1262.12,-474.5\"/>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-451.82\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;date_id&quot;)) + (1)].alias(&quot;date_id&quot;)]</text>\n</g>\n<!-- p1&#45;&#45;p2 -->\n<g id=\"edge1\" class=\"edge\">\n<title>p1&#45;&#45;p2</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-510.28C1049.75,-498.33 1049.75,-484.9 1049.75,-474.59\"/>\n</g>\n<!-- p3 -->\n<g id=\"node3\" class=\"node\">\n<title>p3</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1091.5,-402.5 1008,-402.5 1008,-366.5 1091.5,-366.5 1091.5,-402.5\"/>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-379.82\" font-family=\"Times,serif\" font-size=\"14.00\">RENAME</text>\n</g>\n<!-- p2&#45;&#45;p3 -->\n<g id=\"edge2\" class=\"edge\">\n<title>p2&#45;&#45;p3</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-438.2C1049.75,-427.35 1049.75,-413.42 1049.75,-402.6\"/>\n</g>\n<!-- p4 -->\n<g id=\"node4\" class=\"node\">\n<title>p4</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1084.75,-330.5 1014.75,-330.5 1014.75,-294.5 1084.75,-294.5 1084.75,-330.5\"/>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-307.82\" font-family=\"Times,serif\" font-size=\"14.00\">π 11/11</text>\n</g>\n<!-- p3&#45;&#45;p4 -->\n<g id=\"edge3\" class=\"edge\">\n<title>p3&#45;&#45;p4</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-366.2C1049.75,-355.35 1049.75,-341.42 1049.75,-330.6\"/>\n</g>\n<!-- p5 -->\n<g id=\"node5\" class=\"node\">\n<title>p5</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1190.5,-258.5 909,-258.5 909,-222.5 1190.5,-222.5 1190.5,-258.5\"/>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-235.82\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n</g>\n<!-- p4&#45;&#45;p5 -->\n<g id=\"edge4\" class=\"edge\">\n<title>p4&#45;&#45;p5</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-294.2C1049.75,-283.35 1049.75,-269.42 1049.75,-258.6\"/>\n</g>\n<!-- p6 -->\n<g id=\"node6\" class=\"node\">\n<title>p6</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1339.75,-186.5 759.75,-186.5 759.75,-150.5 1339.75,-150.5 1339.75,-186.5\"/>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-163.82\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n</g>\n<!-- p5&#45;&#45;p6 -->\n<g id=\"edge5\" class=\"edge\">\n<title>p5&#45;&#45;p6</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-222.2C1049.75,-211.35 1049.75,-197.42 1049.75,-186.6\"/>\n</g>\n<!-- p7 -->\n<g id=\"node7\" class=\"node\">\n<title>p7</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1084.75,-114.5 1014.75,-114.5 1014.75,-78.5 1084.75,-78.5 1084.75,-114.5\"/>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-91.83\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n</g>\n<!-- p6&#45;&#45;p7 -->\n<g id=\"edge6\" class=\"edge\">\n<title>p6&#45;&#45;p7</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-150.2C1049.75,-139.35 1049.75,-125.42 1049.75,-114.6\"/>\n</g>\n<!-- p8 -->\n<g id=\"node8\" class=\"node\">\n<title>p8</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1554.25,-42.5 545.25,-42.5 545.25,0 1554.25,0 1554.25,-42.5\"/>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-25.2\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n<text text-anchor=\"middle\" x=\"1049.75\" y=\"-7.95\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n</g>\n<!-- p7&#45;&#45;p8 -->\n<g id=\"edge7\" class=\"edge\">\n<title>p7&#45;&#45;p8</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-78.14C1049.75,-67.56 1049.75,-53.99 1049.75,-42.87\"/>\n</g>\n</g>\n</svg>\n"},"metadata":{}}],"execution_count":4},{"cell_type":"markdown","source":"\n.select(pl.col(CONFIG.lag_cols_original)): train データフレームから、遅延特徴量として使用する列 (CONFIG.lag_cols_original) を選択します。\n\n.rename(CONFIG.lag_cols_rename): 選択された列の名前を CONFIG.lag_cols_rename 辞書に従って変更します。元の名前 (responder_X) が \"responder_X_lag_1\" に置き換えられます。\n\n.with_columns(date_id = pl.col('date_id') + 1): 新しい列 date_id を追加し、元の date_id に 1 を加算します。これにより、1 日遅れのデータを示すようにします。\n\n.group_by([\"date_id\", \"symbol_id\"], maintain_order=True).last(): date_id と symbol_id でグループ化し、各グループの最後のレコードのみ残します (last())。これにより、1 日前の同じシンボルIDのデータを取得します。\n\nlags: 処理後の遅延特徴量データフレーム lags が得られます。\n\nまとめ\n\nこのコードは、トレーニングデータ (train) から、1 日遅れのレスポンダー変数などを使用した遅延特徴量を生成しています。遅延特徴量は、過去の情報を取り込むことで予測精度向上に役立つ可能性があります。","metadata":{}},{"cell_type":"markdown","source":"# Merge training data and lags data","metadata":{}},{"cell_type":"code","source":"train = train.join(lags, on=[\"date_id\", \"symbol_id\"],  how=\"left\")\ntrain","metadata":{"execution":{"iopub.status.busy":"2024-12-22T17:12:45.953327Z","iopub.execute_input":"2024-12-22T17:12:45.954781Z","iopub.status.idle":"2024-12-22T17:12:45.994103Z","shell.execute_reply.started":"2024-12-22T17:12:45.954728Z","shell.execute_reply":"2024-12-22T17:12:45.992537Z"},"trusted":true},"outputs":[{"execution_count":5,"output_type":"execute_result","data":{"text/plain":"<LazyFrame at 0x7AE8735F1480>","text/html":"<h4>NAIVE QUERY PLAN</h4><p>run <b>LazyFrame.show_graph()</b> to see the optimized version</p><?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<!-- Generated by graphviz version 12.0.0 (20240803.0821)\n -->\n<!-- Title: polars_query Pages: 1 -->\n<svg width=\"2771pt\" height=\"681pt\"\n viewBox=\"0.00 0.00 2771.25 680.50\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n<g id=\"graph0\" class=\"graph\" transform=\"scale(1 1) rotate(0) translate(4 676.5)\">\n<title>polars_query</title>\n<polygon fill=\"white\" stroke=\"none\" points=\"-4,4 -4,-676.5 2767.25,-676.5 2767.25,4 -4,4\"/>\n<!-- p1 -->\n<g id=\"node1\" class=\"node\">\n<title>p1</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1254.12,-672.5 962.88,-672.5 962.88,-612.75 1254.12,-612.75 1254.12,-672.5\"/>\n<text text-anchor=\"middle\" x=\"1108.5\" y=\"-655.2\" font-family=\"Times,serif\" font-size=\"14.00\">JOIN LEFT</text>\n<text text-anchor=\"middle\" x=\"1108.5\" y=\"-637.95\" font-family=\"Times,serif\" font-size=\"14.00\">left: [col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)];</text>\n<text text-anchor=\"middle\" x=\"1108.5\" y=\"-620.7\" font-family=\"Times,serif\" font-size=\"14.00\">right: [col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n</g>\n<!-- p2 -->\n<g id=\"node2\" class=\"node\">\n<title>p2</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"645.25,-564.88 363.75,-564.88 363.75,-528.88 645.25,-528.88 645.25,-564.88\"/>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-542.2\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n</g>\n<!-- p1&#45;&#45;p2 -->\n<g id=\"edge1\" class=\"edge\">\n<title>p1&#45;&#45;p2</title>\n<path fill=\"none\" stroke=\"black\" d=\"M962.54,-622.59C873.39,-610.51 757.17,-593.96 654.5,-576.75 633.97,-573.31 611.92,-569.26 591.23,-565.31\"/>\n</g>\n<!-- p6 -->\n<g id=\"node6\" class=\"node\">\n<title>p6</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"2763.25,-576.75 663.75,-576.75 663.75,-517 2763.25,-517 2763.25,-576.75\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-559.45\" font-family=\"Times,serif\" font-size=\"14.00\">AGG [col(&quot;responder_0_lag_1&quot;).last(), col(&quot;responder_1_lag_1&quot;).last(), col(&quot;responder_2_lag_1&quot;).last(), col(&quot;responder_3_lag_1&quot;).last(), col(&quot;responder_4_lag_1&quot;).last(), col(&quot;responder_5_lag_1&quot;).last(), col(&quot;responder_6_lag_1&quot;).last(), col(&quot;responder_7_lag_1&quot;).last(), col(&quot;responder_8_lag_1&quot;).last()]</text>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-542.2\" font-family=\"Times,serif\" font-size=\"14.00\">BY</text>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-524.95\" font-family=\"Times,serif\" font-size=\"14.00\">[col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n</g>\n<!-- p1&#45;&#45;p6 -->\n<g id=\"edge5\" class=\"edge\">\n<title>p1&#45;&#45;p6</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1254.57,-618.99C1335.52,-606.45 1437.09,-590.71 1524.08,-577.23\"/>\n</g>\n<!-- p3 -->\n<g id=\"node3\" class=\"node\">\n<title>p3</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"794.5,-481 214.5,-481 214.5,-445 794.5,-445 794.5,-481\"/>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-458.32\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n</g>\n<!-- p2&#45;&#45;p3 -->\n<g id=\"edge2\" class=\"edge\">\n<title>p2&#45;&#45;p3</title>\n<path fill=\"none\" stroke=\"black\" d=\"M504.5,-528.51C504.5,-514.62 504.5,-495.23 504.5,-481.34\"/>\n</g>\n<!-- p4 -->\n<g id=\"node4\" class=\"node\">\n<title>p4</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"539.5,-409 469.5,-409 469.5,-373 539.5,-373 539.5,-409\"/>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-386.32\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n</g>\n<!-- p3&#45;&#45;p4 -->\n<g id=\"edge3\" class=\"edge\">\n<title>p3&#45;&#45;p4</title>\n<path fill=\"none\" stroke=\"black\" d=\"M504.5,-444.7C504.5,-433.85 504.5,-419.92 504.5,-409.1\"/>\n</g>\n<!-- p5 -->\n<g id=\"node5\" class=\"node\">\n<title>p5</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1009,-337 0,-337 0,-294.5 1009,-294.5 1009,-337\"/>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-319.7\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-302.45\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n</g>\n<!-- p4&#45;&#45;p5 -->\n<g id=\"edge4\" class=\"edge\">\n<title>p4&#45;&#45;p5</title>\n<path fill=\"none\" stroke=\"black\" d=\"M504.5,-372.64C504.5,-362.06 504.5,-348.49 504.5,-337.37\"/>\n</g>\n<!-- p7 -->\n<g id=\"node7\" class=\"node\">\n<title>p7</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1925.88,-481 1501.12,-481 1501.12,-445 1925.88,-445 1925.88,-481\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-458.32\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;date_id&quot;)) + (1)].alias(&quot;date_id&quot;)]</text>\n</g>\n<!-- p6&#45;&#45;p7 -->\n<g id=\"edge6\" class=\"edge\">\n<title>p6&#45;&#45;p7</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-516.78C1713.5,-504.83 1713.5,-491.4 1713.5,-481.09\"/>\n</g>\n<!-- p8 -->\n<g id=\"node8\" class=\"node\">\n<title>p8</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1755.25,-409 1671.75,-409 1671.75,-373 1755.25,-373 1755.25,-409\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-386.32\" font-family=\"Times,serif\" font-size=\"14.00\">RENAME</text>\n</g>\n<!-- p7&#45;&#45;p8 -->\n<g id=\"edge7\" class=\"edge\">\n<title>p7&#45;&#45;p8</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-444.7C1713.5,-433.85 1713.5,-419.92 1713.5,-409.1\"/>\n</g>\n<!-- p9 -->\n<g id=\"node9\" class=\"node\">\n<title>p9</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1748.5,-333.75 1678.5,-333.75 1678.5,-297.75 1748.5,-297.75 1748.5,-333.75\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-311.07\" font-family=\"Times,serif\" font-size=\"14.00\">π 11/11</text>\n</g>\n<!-- p8&#45;&#45;p9 -->\n<g id=\"edge8\" class=\"edge\">\n<title>p8&#45;&#45;p9</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-372.64C1713.5,-361.05 1713.5,-345.86 1713.5,-334.24\"/>\n</g>\n<!-- p10 -->\n<g id=\"node10\" class=\"node\">\n<title>p10</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1854.25,-258.5 1572.75,-258.5 1572.75,-222.5 1854.25,-222.5 1854.25,-258.5\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-235.82\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n</g>\n<!-- p9&#45;&#45;p10 -->\n<g id=\"edge9\" class=\"edge\">\n<title>p9&#45;&#45;p10</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-297.39C1713.5,-285.8 1713.5,-270.61 1713.5,-258.99\"/>\n</g>\n<!-- p11 -->\n<g id=\"node11\" class=\"node\">\n<title>p11</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"2003.5,-186.5 1423.5,-186.5 1423.5,-150.5 2003.5,-150.5 2003.5,-186.5\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-163.82\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n</g>\n<!-- p10&#45;&#45;p11 -->\n<g id=\"edge10\" class=\"edge\">\n<title>p10&#45;&#45;p11</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-222.2C1713.5,-211.35 1713.5,-197.42 1713.5,-186.6\"/>\n</g>\n<!-- p12 -->\n<g id=\"node12\" class=\"node\">\n<title>p12</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1748.5,-114.5 1678.5,-114.5 1678.5,-78.5 1748.5,-78.5 1748.5,-114.5\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-91.83\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n</g>\n<!-- p11&#45;&#45;p12 -->\n<g id=\"edge11\" class=\"edge\">\n<title>p11&#45;&#45;p12</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-150.2C1713.5,-139.35 1713.5,-125.42 1713.5,-114.6\"/>\n</g>\n<!-- p13 -->\n<g id=\"node13\" class=\"node\">\n<title>p13</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"2218,-42.5 1209,-42.5 1209,0 2218,0 2218,-42.5\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-25.2\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-7.95\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n</g>\n<!-- p12&#45;&#45;p13 -->\n<g id=\"edge12\" class=\"edge\">\n<title>p12&#45;&#45;p13</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-78.14C1713.5,-67.56 1713.5,-53.99 1713.5,-42.87\"/>\n</g>\n</g>\n</svg>\n"},"metadata":{}}],"execution_count":5},{"cell_type":"markdown","source":"train.join(...): train データフレームに対して結合操作を行います。\n\nlags: 結合する相手のデータフレームです。これは、前述のコードで生成された遅延特徴量を含むデータフレームです。\n\non=[\"date_id\", \"symbol_id\"]: 結合キーを指定します。train と lags の両方のデータフレームにおいて、date_id と symbol_id の値が一致する行同士を結合します。つまり、同じ日付とシンボルのデータ同士が結合されます。\n\nhow=\"left\": 結合方法を指定します。\"left\" は左結合を意味します。左結合では、左側のデータフレーム (train) のすべての行が結果に含まれます。結合キーが一致する行が右側のデータフレーム (lags) に存在する場合は、それらの行が結合されます。一致する行がない場合は、右側の列は欠損値 (NaN/Null) で埋められます。\n\nこのコードの目的\n\nこのコードの目的は、train データフレームに遅延特徴量 (lags) を追加することです。これにより、モデルは過去のデータに基づいて予測を行うことができるようになります。左結合を使用しているため、train のすべてのデータが保持され、遅延特徴量が利用できない場合は欠損値として扱われます。\n\nまとめ\n\ntrain.join(lags, on=[\"date_id\", \"symbol_id\"], how=\"left\") は、train データフレームに lags データフレームを左結合し、date_id と symbol_id を結合キーとして使用することで、各 train データに1日前の同じシンボルのレスポンダー変数の値（遅延特徴量）を追加しています。","metadata":{}},{"cell_type":"markdown","source":"# Split training data and validation data","metadata":{}},{"cell_type":"code","source":"len_train   = train.select(pl.col(\"date_id\")).collect().shape[0]\nvalid_records = int(len_train * CONFIG.valid_ratio)\nlen_ofl_mdl = len_train - valid_records\nlast_tr_dt  = train.select(pl.col(\"date_id\")).collect().row(len_ofl_mdl)[0]\n\nprint(f\"\\n len_train = {len_train}\")\nprint(f\"\\n len_ofl_mdl = {len_ofl_mdl}\")\nprint(f\"\\n---> Last offline train date = {last_tr_dt}\\n\")\n\ntraining_data = train.filter(pl.col(\"date_id\").le(last_tr_dt))\nvalidation_data   = train.filter(pl.col(\"date_id\").gt(last_tr_dt))","metadata":{"execution":{"iopub.status.busy":"2024-12-22T17:12:45.995683Z","iopub.execute_input":"2024-12-22T17:12:45.996104Z","iopub.status.idle":"2024-12-22T17:12:50.388581Z","shell.execute_reply.started":"2024-12-22T17:12:45.996068Z","shell.execute_reply":"2024-12-22T17:12:50.387376Z"},"trusted":true},"outputs":[{"name":"stdout","text":"\n len_train = 22104280\n\n len_ofl_mdl = 20999066\n\n---> Last offline train date = 1669\n\n","output_type":"stream"}],"execution_count":6},{"cell_type":"markdown","source":"train.select(pl.col(\"date_id\")): train データフレームから \"date_id\" 列だけ選択します。\n\n.collect(): .shape[0] を使う前に、遅延評価を解除するためにデータをメモリに読み込みます。\n\n.shape[0]: データフレームの行数を取得します。\n\nCONFIG.valid_ratio: バリデーションデータの割合が格納されている変数です (例えば、0.05)。\n\nint(len_train * CONFIG.valid_ratio): len_train に CONFIG.valid_ratio を掛け、バリデーションデータのレコード数を計算します。int() で整数型に変換します。\n\nlen_train: 1. で取得したトレーニングデータの全長。\n\nvalid_records: 2. で計算したバリデーションデータのレコード数。\n\nlen_train - valid_records: トレーニングデータからバリデーションデータの分を引いて、オフラインモデルの訓練データの長さを計算します。\n\ntrain.select(pl.col(\"date_id\")): 1. と同様に、\"date_id\" 列だけ選択します。\n\n.collect(): .row() を使う前に、遅延評価を解除するためにデータをメモリに読み込みます。\n\n.row(len_ofl_mdl): 行番号 len_ofl_mdl の行を取得します。これは、オフラインモデルの訓練データの最後の行にあたります。\n\n[0]: 取得した行から、\"date_id\" 列の値 (つまり、日付) を取り出します。\n\nle: less than or equal to の略で、「以下」を意味します。つまり、a le b は「a は b 以下」(a <= b) と同じ意味です。\n\ngt: greater than の略で、「より大きい」を意味します。つまり、a gt b は「a は b より大きい」(a > b) と同じ意味です。\n","metadata":{}},{"cell_type":"code","source":"validation_data","metadata":{"execution":{"iopub.status.busy":"2024-12-22T17:12:50.389904Z","iopub.execute_input":"2024-12-22T17:12:50.390209Z","iopub.status.idle":"2024-12-22T17:12:50.421219Z","shell.execute_reply.started":"2024-12-22T17:12:50.390178Z","shell.execute_reply":"2024-12-22T17:12:50.420027Z"},"trusted":true},"outputs":[{"execution_count":7,"output_type":"execute_result","data":{"text/plain":"<LazyFrame at 0x7AE8A0B38580>","text/html":"<h4>NAIVE QUERY PLAN</h4><p>run <b>LazyFrame.show_graph()</b> to see the optimized version</p><?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<!-- Generated by graphviz version 12.0.0 (20240803.0821)\n -->\n<!-- Title: polars_query Pages: 1 -->\n<svg width=\"2771pt\" height=\"753pt\"\n viewBox=\"0.00 0.00 2771.25 752.50\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n<g id=\"graph0\" class=\"graph\" transform=\"scale(1 1) rotate(0) translate(4 748.5)\">\n<title>polars_query</title>\n<polygon fill=\"white\" stroke=\"none\" points=\"-4,4 -4,-748.5 2767.25,-748.5 2767.25,4 -4,4\"/>\n<!-- p1 -->\n<g id=\"node1\" class=\"node\">\n<title>p1</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1249.25,-744.5 967.75,-744.5 967.75,-708.5 1249.25,-708.5 1249.25,-744.5\"/>\n<text text-anchor=\"middle\" x=\"1108.5\" y=\"-721.83\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1669)]</text>\n</g>\n<!-- p2 -->\n<g id=\"node2\" class=\"node\">\n<title>p2</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1254.12,-672.5 962.88,-672.5 962.88,-612.75 1254.12,-612.75 1254.12,-672.5\"/>\n<text text-anchor=\"middle\" x=\"1108.5\" y=\"-655.2\" font-family=\"Times,serif\" font-size=\"14.00\">JOIN LEFT</text>\n<text text-anchor=\"middle\" x=\"1108.5\" y=\"-637.95\" font-family=\"Times,serif\" font-size=\"14.00\">left: [col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)];</text>\n<text text-anchor=\"middle\" x=\"1108.5\" y=\"-620.7\" font-family=\"Times,serif\" font-size=\"14.00\">right: [col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n</g>\n<!-- p1&#45;&#45;p2 -->\n<g id=\"edge1\" class=\"edge\">\n<title>p1&#45;&#45;p2</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1108.5,-708.14C1108.5,-697.9 1108.5,-684.69 1108.5,-672.89\"/>\n</g>\n<!-- p3 -->\n<g id=\"node3\" class=\"node\">\n<title>p3</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"645.25,-564.88 363.75,-564.88 363.75,-528.88 645.25,-528.88 645.25,-564.88\"/>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-542.2\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n</g>\n<!-- p2&#45;&#45;p3 -->\n<g id=\"edge2\" class=\"edge\">\n<title>p2&#45;&#45;p3</title>\n<path fill=\"none\" stroke=\"black\" d=\"M962.54,-622.59C873.39,-610.51 757.17,-593.96 654.5,-576.75 633.97,-573.31 611.92,-569.26 591.23,-565.31\"/>\n</g>\n<!-- p7 -->\n<g id=\"node7\" class=\"node\">\n<title>p7</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"2763.25,-576.75 663.75,-576.75 663.75,-517 2763.25,-517 2763.25,-576.75\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-559.45\" font-family=\"Times,serif\" font-size=\"14.00\">AGG [col(&quot;responder_0_lag_1&quot;).last(), col(&quot;responder_1_lag_1&quot;).last(), col(&quot;responder_2_lag_1&quot;).last(), col(&quot;responder_3_lag_1&quot;).last(), col(&quot;responder_4_lag_1&quot;).last(), col(&quot;responder_5_lag_1&quot;).last(), col(&quot;responder_6_lag_1&quot;).last(), col(&quot;responder_7_lag_1&quot;).last(), col(&quot;responder_8_lag_1&quot;).last()]</text>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-542.2\" font-family=\"Times,serif\" font-size=\"14.00\">BY</text>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-524.95\" font-family=\"Times,serif\" font-size=\"14.00\">[col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n</g>\n<!-- p2&#45;&#45;p7 -->\n<g id=\"edge6\" class=\"edge\">\n<title>p2&#45;&#45;p7</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1254.57,-618.99C1335.52,-606.45 1437.09,-590.71 1524.08,-577.23\"/>\n</g>\n<!-- p4 -->\n<g id=\"node4\" class=\"node\">\n<title>p4</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"794.5,-481 214.5,-481 214.5,-445 794.5,-445 794.5,-481\"/>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-458.32\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n</g>\n<!-- p3&#45;&#45;p4 -->\n<g id=\"edge3\" class=\"edge\">\n<title>p3&#45;&#45;p4</title>\n<path fill=\"none\" stroke=\"black\" d=\"M504.5,-528.51C504.5,-514.62 504.5,-495.23 504.5,-481.34\"/>\n</g>\n<!-- p5 -->\n<g id=\"node5\" class=\"node\">\n<title>p5</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"539.5,-409 469.5,-409 469.5,-373 539.5,-373 539.5,-409\"/>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-386.32\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n</g>\n<!-- p4&#45;&#45;p5 -->\n<g id=\"edge4\" class=\"edge\">\n<title>p4&#45;&#45;p5</title>\n<path fill=\"none\" stroke=\"black\" d=\"M504.5,-444.7C504.5,-433.85 504.5,-419.92 504.5,-409.1\"/>\n</g>\n<!-- p6 -->\n<g id=\"node6\" class=\"node\">\n<title>p6</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1009,-337 0,-337 0,-294.5 1009,-294.5 1009,-337\"/>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-319.7\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n<text text-anchor=\"middle\" x=\"504.5\" y=\"-302.45\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n</g>\n<!-- p5&#45;&#45;p6 -->\n<g id=\"edge5\" class=\"edge\">\n<title>p5&#45;&#45;p6</title>\n<path fill=\"none\" stroke=\"black\" d=\"M504.5,-372.64C504.5,-362.06 504.5,-348.49 504.5,-337.37\"/>\n</g>\n<!-- p8 -->\n<g id=\"node8\" class=\"node\">\n<title>p8</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1925.88,-481 1501.12,-481 1501.12,-445 1925.88,-445 1925.88,-481\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-458.32\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;date_id&quot;)) + (1)].alias(&quot;date_id&quot;)]</text>\n</g>\n<!-- p7&#45;&#45;p8 -->\n<g id=\"edge7\" class=\"edge\">\n<title>p7&#45;&#45;p8</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-516.78C1713.5,-504.83 1713.5,-491.4 1713.5,-481.09\"/>\n</g>\n<!-- p9 -->\n<g id=\"node9\" class=\"node\">\n<title>p9</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1755.25,-409 1671.75,-409 1671.75,-373 1755.25,-373 1755.25,-409\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-386.32\" font-family=\"Times,serif\" font-size=\"14.00\">RENAME</text>\n</g>\n<!-- p8&#45;&#45;p9 -->\n<g id=\"edge8\" class=\"edge\">\n<title>p8&#45;&#45;p9</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-444.7C1713.5,-433.85 1713.5,-419.92 1713.5,-409.1\"/>\n</g>\n<!-- p10 -->\n<g id=\"node10\" class=\"node\">\n<title>p10</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1748.5,-333.75 1678.5,-333.75 1678.5,-297.75 1748.5,-297.75 1748.5,-333.75\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-311.07\" font-family=\"Times,serif\" font-size=\"14.00\">π 11/11</text>\n</g>\n<!-- p9&#45;&#45;p10 -->\n<g id=\"edge9\" class=\"edge\">\n<title>p9&#45;&#45;p10</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-372.64C1713.5,-361.05 1713.5,-345.86 1713.5,-334.24\"/>\n</g>\n<!-- p11 -->\n<g id=\"node11\" class=\"node\">\n<title>p11</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1854.25,-258.5 1572.75,-258.5 1572.75,-222.5 1854.25,-222.5 1854.25,-258.5\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-235.82\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n</g>\n<!-- p10&#45;&#45;p11 -->\n<g id=\"edge10\" class=\"edge\">\n<title>p10&#45;&#45;p11</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-297.39C1713.5,-285.8 1713.5,-270.61 1713.5,-258.99\"/>\n</g>\n<!-- p12 -->\n<g id=\"node12\" class=\"node\">\n<title>p12</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"2003.5,-186.5 1423.5,-186.5 1423.5,-150.5 2003.5,-150.5 2003.5,-186.5\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-163.82\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n</g>\n<!-- p11&#45;&#45;p12 -->\n<g id=\"edge11\" class=\"edge\">\n<title>p11&#45;&#45;p12</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-222.2C1713.5,-211.35 1713.5,-197.42 1713.5,-186.6\"/>\n</g>\n<!-- p13 -->\n<g id=\"node13\" class=\"node\">\n<title>p13</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"1748.5,-114.5 1678.5,-114.5 1678.5,-78.5 1748.5,-78.5 1748.5,-114.5\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-91.83\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n</g>\n<!-- p12&#45;&#45;p13 -->\n<g id=\"edge12\" class=\"edge\">\n<title>p12&#45;&#45;p13</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-150.2C1713.5,-139.35 1713.5,-125.42 1713.5,-114.6\"/>\n</g>\n<!-- p14 -->\n<g id=\"node14\" class=\"node\">\n<title>p14</title>\n<polygon fill=\"none\" stroke=\"black\" points=\"2218,-42.5 1209,-42.5 1209,0 2218,0 2218,-42.5\"/>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-25.2\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n<text text-anchor=\"middle\" x=\"1713.5\" y=\"-7.95\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n</g>\n<!-- p13&#45;&#45;p14 -->\n<g id=\"edge13\" class=\"edge\">\n<title>p13&#45;&#45;p14</title>\n<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-78.14C1713.5,-67.56 1713.5,-53.99 1713.5,-42.87\"/>\n</g>\n</g>\n</svg>\n"},"metadata":{}}],"execution_count":7},{"cell_type":"markdown","source":"# Save data as parquets","metadata":{}},{"cell_type":"code","source":"training_data.collect().\\\nwrite_parquet(\n    f\"training.parquet\", partition_by = \"date_id\",\n)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2024-12-22T17:12:50.422599Z","iopub.execute_input":"2024-12-22T17:12:50.422922Z","iopub.status.idle":"2024-12-22T17:14:48.056199Z","shell.execute_reply.started":"2024-12-22T17:12:50.422892Z","shell.execute_reply":"2024-12-22T17:14:48.054638Z"}},"outputs":[],"execution_count":8},{"cell_type":"code","source":"pl.read_parquet(\"/kaggle/working/training.parquet/date_id=1101/00000000.parquet\")","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2024-12-22T17:25:43.036423Z","iopub.execute_input":"2024-12-22T17:25:43.038227Z","iopub.status.idle":"2024-12-22T17:25:43.198713Z","shell.execute_reply.started":"2024-12-22T17:25:43.038157Z","shell.execute_reply":"2024-12-22T17:25:43.197389Z"}},"outputs":[{"execution_count":11,"output_type":"execute_result","data":{"text/plain":"shape: (37_752, 104)\n┌──────────┬─────────┬─────────┬───────────┬───┬────────────┬────────────┬────────────┬────────────┐\n│ id       ┆ date_id ┆ time_id ┆ symbol_id ┆ … ┆ responder_ ┆ responder_ ┆ responder_ ┆ responder_ │\n│ ---      ┆ ---     ┆ ---     ┆ ---       ┆   ┆ 5_lag_1    ┆ 6_lag_1    ┆ 7_lag_1    ┆ 8_lag_1    │\n│ u32      ┆ i16     ┆ i16     ┆ i8        ┆   ┆ ---        ┆ ---        ┆ ---        ┆ ---        │\n│          ┆         ┆         ┆           ┆   ┆ f32        ┆ f32        ┆ f32        ┆ f32        │\n╞══════════╪═════════╪═════════╪═══════════╪═══╪════════════╪════════════╪════════════╪════════════╡\n│ 25023058 ┆ 1101    ┆ 0       ┆ 0         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ 25023059 ┆ 1101    ┆ 0       ┆ 1         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ 25023060 ┆ 1101    ┆ 0       ┆ 2         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ 25023061 ┆ 1101    ┆ 0       ┆ 3         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ 25023062 ┆ 1101    ┆ 0       ┆ 4         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ …        ┆ …       ┆ …       ┆ …         ┆ … ┆ …          ┆ …          ┆ …          ┆ …          │\n│ 25060805 ┆ 1101    ┆ 967     ┆ 34        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ 25060806 ┆ 1101    ┆ 967     ┆ 35        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ 25060807 ┆ 1101    ┆ 967     ┆ 36        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ 25060808 ┆ 1101    ┆ 967     ┆ 37        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n│ 25060809 ┆ 1101    ┆ 967     ┆ 38        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n└──────────┴─────────┴─────────┴───────────┴───┴────────────┴────────────┴────────────┴────────────┘","text/html":"<div><style>\n.dataframe > thead > tr,\n.dataframe > tbody > tr {\n  text-align: right;\n  white-space: pre-wrap;\n}\n</style>\n<small>shape: (37_752, 104)</small><table border=\"1\" class=\"dataframe\"><thead><tr><th>id</th><th>date_id</th><th>time_id</th><th>symbol_id</th><th>weight</th><th>feature_00</th><th>feature_01</th><th>feature_02</th><th>feature_03</th><th>feature_04</th><th>feature_05</th><th>feature_06</th><th>feature_07</th><th>feature_08</th><th>feature_09</th><th>feature_10</th><th>feature_11</th><th>feature_12</th><th>feature_13</th><th>feature_14</th><th>feature_15</th><th>feature_16</th><th>feature_17</th><th>feature_18</th><th>feature_19</th><th>feature_20</th><th>feature_21</th><th>feature_22</th><th>feature_23</th><th>feature_24</th><th>feature_25</th><th>feature_26</th><th>feature_27</th><th>feature_28</th><th>feature_29</th><th>feature_30</th><th>feature_31</th><th>&hellip;</th><th>feature_62</th><th>feature_63</th><th>feature_64</th><th>feature_65</th><th>feature_66</th><th>feature_67</th><th>feature_68</th><th>feature_69</th><th>feature_70</th><th>feature_71</th><th>feature_72</th><th>feature_73</th><th>feature_74</th><th>feature_75</th><th>feature_76</th><th>feature_77</th><th>feature_78</th><th>responder_0</th><th>responder_1</th><th>responder_2</th><th>responder_3</th><th>responder_4</th><th>responder_5</th><th>responder_6</th><th>responder_7</th><th>responder_8</th><th>partition_id</th><th>label</th><th>responder_0_lag_1</th><th>responder_1_lag_1</th><th>responder_2_lag_1</th><th>responder_3_lag_1</th><th>responder_4_lag_1</th><th>responder_5_lag_1</th><th>responder_6_lag_1</th><th>responder_7_lag_1</th><th>responder_8_lag_1</th></tr><tr><td>u32</td><td>i16</td><td>i16</td><td>i8</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>i8</td><td>i8</td><td>i16</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>&hellip;</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>i64</td><td>i32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td></tr></thead><tbody><tr><td>25023058</td><td>1101</td><td>0</td><td>0</td><td>1.913215</td><td>0.458568</td><td>-0.05264</td><td>-0.044876</td><td>0.124223</td><td>2.819707</td><td>-0.746395</td><td>0.270162</td><td>0.232489</td><td>0.638483</td><td>11</td><td>7</td><td>76</td><td>-0.859027</td><td>0.695877</td><td>-0.356197</td><td>null</td><td>0.300569</td><td>null</td><td>-1.081869</td><td>-1.249594</td><td>0.586737</td><td>-0.283532</td><td>0.351779</td><td>1.07356</td><td>-0.974062</td><td>-0.908026</td><td>0.737549</td><td>0.87567</td><td>0.616378</td><td>0.052371</td><td>0.482981</td><td>-0.269024</td><td>&hellip;</td><td>-0.140479</td><td>0.042491</td><td>-0.028724</td><td>-1.427209</td><td>-1.99307</td><td>-0.862814</td><td>1.568264</td><td>-0.094396</td><td>-0.809437</td><td>-0.145835</td><td>-0.684791</td><td>null</td><td>null</td><td>-0.122062</td><td>-0.378493</td><td>-0.36432</td><td>-0.260619</td><td>0.108411</td><td>-0.189889</td><td>0.095152</td><td>1.188086</td><td>0.183916</td><td>-0.569924</td><td>1.233719</td><td>0.429217</td><td>-0.708557</td><td>6</td><td>2</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25023059</td><td>1101</td><td>0</td><td>1</td><td>4.360143</td><td>0.111398</td><td>0.500473</td><td>0.083353</td><td>0.395555</td><td>2.468412</td><td>-0.706918</td><td>0.313437</td><td>0.172877</td><td>0.371777</td><td>11</td><td>7</td><td>76</td><td>-0.878114</td><td>1.199868</td><td>-0.304281</td><td>null</td><td>-0.151362</td><td>null</td><td>-1.775065</td><td>-1.312861</td><td>0.16722</td><td>0.034493</td><td>2.383581</td><td>1.70292</td><td>-0.74334</td><td>-0.219267</td><td>0.377675</td><td>1.223783</td><td>1.276546</td><td>-0.343797</td><td>-0.154821</td><td>0.051061</td><td>&hellip;</td><td>-0.277945</td><td>-0.191327</td><td>-0.312494</td><td>-1.107761</td><td>-1.085603</td><td>-0.759455</td><td>1.070539</td><td>-0.126439</td><td>-1.20999</td><td>0.30999</td><td>-0.537283</td><td>null</td><td>null</td><td>-0.22374</td><td>-0.256861</td><td>-0.288086</td><td>-0.323778</td><td>-0.155402</td><td>-0.154787</td><td>-0.243248</td><td>-0.497277</td><td>-0.25804</td><td>-0.358548</td><td>-0.582184</td><td>-0.333726</td><td>-0.26815</td><td>6</td><td>-1</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25023060</td><td>1101</td><td>0</td><td>2</td><td>1.259379</td><td>0.536855</td><td>0.309993</td><td>0.015098</td><td>0.318689</td><td>2.594687</td><td>-1.1574</td><td>0.48536</td><td>0.329561</td><td>0.671811</td><td>81</td><td>2</td><td>59</td><td>-1.163686</td><td>-0.307989</td><td>-0.858999</td><td>null</td><td>-0.30705</td><td>null</td><td>-1.227922</td><td>-1.326199</td><td>-1.473596</td><td>-0.266024</td><td>-0.474967</td><td>-0.199162</td><td>-1.760276</td><td>-1.485319</td><td>0.677112</td><td>1.269566</td><td>1.747018</td><td>-0.725915</td><td>-0.495244</td><td>-0.274749</td><td>&hellip;</td><td>-0.280476</td><td>-0.211912</td><td>-0.219207</td><td>-2.506536</td><td>-2.055502</td><td>-1.226109</td><td>-0.096572</td><td>-0.445255</td><td>-1.033872</td><td>-0.290695</td><td>-0.800315</td><td>null</td><td>null</td><td>-0.104352</td><td>-0.221018</td><td>-0.382566</td><td>-0.330158</td><td>-0.327308</td><td>-0.253688</td><td>-0.561014</td><td>-1.515344</td><td>1.91926</td><td>-3.469981</td><td>-1.465263</td><td>1.964456</td><td>-3.273642</td><td>6</td><td>-2</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25023061</td><td>1101</td><td>0</td><td>3</td><td>1.498643</td><td>-0.016845</td><td>-0.104391</td><td>-0.202445</td><td>0.404921</td><td>2.384175</td><td>-0.447801</td><td>0.22617</td><td>0.172059</td><td>0.363244</td><td>4</td><td>3</td><td>11</td><td>-0.915372</td><td>1.030181</td><td>-0.212352</td><td>null</td><td>-0.169328</td><td>null</td><td>-1.573598</td><td>-1.306565</td><td>-0.405128</td><td>0.050558</td><td>-0.176753</td><td>-0.542888</td><td>0.304873</td><td>1.171678</td><td>-0.502733</td><td>-1.08011</td><td>-0.591162</td><td>-0.527882</td><td>-0.743914</td><td>0.045586</td><td>&hellip;</td><td>-0.31175</td><td>-0.345839</td><td>-0.413218</td><td>-1.890556</td><td>-2.079406</td><td>-0.722361</td><td>0.424735</td><td>-0.28688</td><td>-0.814299</td><td>1.873171</td><td>-0.061714</td><td>null</td><td>null</td><td>1.16344</td><td>1.1204</td><td>0.125606</td><td>0.188438</td><td>-0.002188</td><td>-0.102668</td><td>-0.763048</td><td>-0.654262</td><td>-1.305771</td><td>-0.187887</td><td>-0.793223</td><td>-1.376819</td><td>0.20175</td><td>6</td><td>-1</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25023062</td><td>1101</td><td>0</td><td>4</td><td>1.013641</td><td>0.269194</td><td>-0.088913</td><td>-0.436358</td><td>-0.025382</td><td>2.440446</td><td>-0.57961</td><td>0.207809</td><td>0.140545</td><td>0.341923</td><td>15</td><td>1</td><td>9</td><td>-1.1123</td><td>0.355613</td><td>-0.510269</td><td>null</td><td>-0.374868</td><td>null</td><td>-1.360212</td><td>-1.567855</td><td>1.298702</td><td>-0.087483</td><td>-0.72015</td><td>-0.582005</td><td>-0.284471</td><td>0.609314</td><td>-1.606182</td><td>-1.231077</td><td>-0.251321</td><td>-0.552514</td><td>-0.45447</td><td>-0.085228</td><td>&hellip;</td><td>-0.12504</td><td>-0.133995</td><td>-0.14408</td><td>-1.557398</td><td>-1.912102</td><td>-0.894412</td><td>0.344008</td><td>-0.377989</td><td>-1.108163</td><td>0.061968</td><td>-0.652792</td><td>null</td><td>null</td><td>0.007712</td><td>0.001405</td><td>-0.245694</td><td>-0.162255</td><td>-0.042635</td><td>-0.071551</td><td>-0.114196</td><td>-0.278691</td><td>-0.149025</td><td>-0.66197</td><td>-0.257424</td><td>-0.088133</td><td>-1.544584</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td></tr><tr><td>25060805</td><td>1101</td><td>967</td><td>34</td><td>1.38958</td><td>-0.7028</td><td>-0.977729</td><td>-0.330834</td><td>-0.704871</td><td>-1.041493</td><td>0.174243</td><td>1.454852</td><td>-0.32982</td><td>-1.294859</td><td>42</td><td>5</td><td>150</td><td>-0.150457</td><td>0.521319</td><td>-0.086012</td><td>-0.754335</td><td>-0.279344</td><td>-0.598974</td><td>0.057134</td><td>0.957063</td><td>0.115745</td><td>-0.209302</td><td>0.178385</td><td>-0.401783</td><td>-0.60871</td><td>-0.560061</td><td>0.051171</td><td>1.543215</td><td>1.624583</td><td>-0.700015</td><td>-0.516634</td><td>-0.227234</td><td>&hellip;</td><td>-0.408149</td><td>-0.281938</td><td>-0.31932</td><td>-0.806948</td><td>0.775138</td><td>-0.20356</td><td>0.803099</td><td>-0.030201</td><td>-0.055284</td><td>0.110207</td><td>-0.164637</td><td>-0.323066</td><td>-0.356105</td><td>-0.3175</td><td>-0.273421</td><td>-0.383094</td><td>-0.320388</td><td>0.312874</td><td>0.231182</td><td>0.113768</td><td>-0.047135</td><td>-0.024395</td><td>-0.167026</td><td>-0.320777</td><td>-0.109656</td><td>-0.726807</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25060806</td><td>1101</td><td>967</td><td>35</td><td>0.943952</td><td>-0.324261</td><td>-0.151253</td><td>0.026357</td><td>-0.119514</td><td>-1.182524</td><td>0.159828</td><td>0.881722</td><td>-0.332037</td><td>-0.931292</td><td>11</td><td>7</td><td>76</td><td>-0.55896</td><td>-0.459197</td><td>-0.411643</td><td>3.958932</td><td>4.155701</td><td>2.940465</td><td>3.910137</td><td>0.49823</td><td>0.749494</td><td>0.014894</td><td>-0.430784</td><td>1.178271</td><td>-0.59572</td><td>-0.073092</td><td>0.091872</td><td>-1.962563</td><td>-2.290511</td><td>3.420314</td><td>4.89368</td><td>0.014831</td><td>&hellip;</td><td>0.550101</td><td>1.594744</td><td>0.921203</td><td>0.35961</td><td>3.119171</td><td>-0.865203</td><td>-0.315087</td><td>-0.395001</td><td>-0.343131</td><td>-0.42275</td><td>-0.220564</td><td>-0.342992</td><td>-0.476394</td><td>-0.187197</td><td>-0.265712</td><td>-0.288886</td><td>-0.12437</td><td>-1.42063</td><td>0.262246</td><td>1.463928</td><td>-0.162056</td><td>-0.098624</td><td>-0.505561</td><td>-0.093831</td><td>-0.027931</td><td>-0.14261</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25060807</td><td>1101</td><td>967</td><td>36</td><td>1.302444</td><td>-0.22352</td><td>-0.513127</td><td>-0.598366</td><td>-0.185704</td><td>-0.910259</td><td>0.175318</td><td>1.495476</td><td>-0.608952</td><td>-1.360056</td><td>68</td><td>6</td><td>388</td><td>1.08706</td><td>2.219226</td><td>2.252061</td><td>1.981443</td><td>0.86858</td><td>1.351121</td><td>4.994243</td><td>1.117165</td><td>-0.540634</td><td>-0.039285</td><td>-0.533067</td><td>1.04184</td><td>-1.058485</td><td>-0.606737</td><td>-0.373143</td><td>-0.924465</td><td>-0.880157</td><td>1.106346</td><td>1.169852</td><td>-0.045873</td><td>&hellip;</td><td>-0.089151</td><td>-0.461169</td><td>-0.083253</td><td>3.607711</td><td>1.14511</td><td>1.169405</td><td>0.828673</td><td>2.751653</td><td>0.731948</td><td>3.580747</td><td>2.642683</td><td>-0.33627</td><td>-0.328574</td><td>-0.182743</td><td>-0.284014</td><td>-0.274022</td><td>-0.296241</td><td>0.647421</td><td>0.061193</td><td>-2.473481</td><td>-0.037256</td><td>-0.03256</td><td>-0.215104</td><td>-0.160578</td><td>-0.056753</td><td>-0.444496</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25060808</td><td>1101</td><td>967</td><td>37</td><td>0.842202</td><td>-0.848737</td><td>-0.869901</td><td>-0.057307</td><td>-0.397627</td><td>-1.259322</td><td>0.133388</td><td>1.299565</td><td>-0.308106</td><td>-1.363458</td><td>34</td><td>4</td><td>214</td><td>0.45396</td><td>0.263169</td><td>0.761553</td><td>-0.577716</td><td>-0.201275</td><td>-0.344857</td><td>-0.280034</td><td>-1.454184</td><td>-0.917644</td><td>-0.226854</td><td>-0.984756</td><td>-0.925856</td><td>-0.419104</td><td>-0.123074</td><td>-0.083158</td><td>-1.307634</td><td>-1.015463</td><td>-0.893838</td><td>-0.454903</td><td>-0.167192</td><td>&hellip;</td><td>-0.506533</td><td>-0.253573</td><td>-0.299359</td><td>0.610885</td><td>-2.19654</td><td>0.533447</td><td>0.339038</td><td>0.858602</td><td>0.504508</td><td>0.449486</td><td>0.267561</td><td>-0.198038</td><td>-0.174703</td><td>0.762484</td><td>0.877354</td><td>-0.114946</td><td>-0.174437</td><td>0.267422</td><td>0.279815</td><td>2.947578</td><td>-0.052169</td><td>-0.052995</td><td>0.194105</td><td>-1.268683</td><td>-0.345363</td><td>-1.616249</td><td>6</td><td>-2</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25060809</td><td>1101</td><td>967</td><td>38</td><td>2.708526</td><td>-0.093785</td><td>-0.530218</td><td>0.011678</td><td>-0.364933</td><td>-1.078341</td><td>0.170624</td><td>0.860342</td><td>-0.261375</td><td>-0.981406</td><td>50</td><td>1</td><td>522</td><td>-0.223665</td><td>0.59994</td><td>0.222349</td><td>-0.330523</td><td>-0.627451</td><td>-0.702775</td><td>-0.006032</td><td>3.764182</td><td>0.49505</td><td>-0.208255</td><td>1.256033</td><td>-0.064132</td><td>-0.341035</td><td>0.57118</td><td>-0.429243</td><td>1.769033</td><td>1.465759</td><td>-0.847868</td><td>-0.723185</td><td>-0.200539</td><td>&hellip;</td><td>-0.413483</td><td>-0.263005</td><td>-0.424876</td><td>-0.932489</td><td>3.66088</td><td>-0.197272</td><td>0.680031</td><td>0.237876</td><td>-0.143687</td><td>0.017006</td><td>0.087483</td><td>-0.272279</td><td>-0.212697</td><td>0.240631</td><td>0.31096</td><td>-0.101432</td><td>-0.060634</td><td>-0.174811</td><td>-0.007507</td><td>-0.64436</td><td>0.287852</td><td>0.174577</td><td>-0.014433</td><td>-0.166157</td><td>-0.04831</td><td>-0.220142</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr></tbody></table></div>"},"metadata":{}}],"execution_count":11},{"cell_type":"code","source":"validation_data.collect().\\\nwrite_parquet(\n    \"validation.parquet\", partition_by = \"date_id\",\n)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2024-12-22T17:14:48.058375Z","iopub.execute_input":"2024-12-22T17:14:48.058941Z","iopub.status.idle":"2024-12-22T17:15:40.333757Z","shell.execute_reply.started":"2024-12-22T17:14:48.058879Z","shell.execute_reply":"2024-12-22T17:15:40.332473Z"}},"outputs":[],"execution_count":9}]}
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "5bede1bb",
+   "metadata": {
+    "papermill": {
+     "duration": 0.005218,
+     "end_time": "2024-12-22T17:30:06.437351",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:06.432133",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# Libraries"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "b40a7979",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:30:06.449033Z",
+     "iopub.status.busy": "2024-12-22T17:30:06.447832Z",
+     "iopub.status.idle": "2024-12-22T17:30:09.337922Z",
+     "shell.execute_reply": "2024-12-22T17:30:09.336770Z"
+    },
+    "papermill": {
+     "duration": 2.898606,
+     "end_time": "2024-12-22T17:30:09.340414",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:06.441808",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "import polars as pl\n",
+    "import numpy as np\n",
+    "import gc\n",
+    "from matplotlib import pyplot as plt\n",
+    "import matplotlib.cm as cm\n",
+    "from sklearn.model_selection import StratifiedGroupKFold"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d57ed4d5",
+   "metadata": {
+    "papermill": {
+     "duration": 0.004062,
+     "end_time": "2024-12-22T17:30:09.349455",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.345393",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# Configurations"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "49904416",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:30:09.361612Z",
+     "iopub.status.busy": "2024-12-22T17:30:09.359512Z",
+     "iopub.status.idle": "2024-12-22T17:30:09.370098Z",
+     "shell.execute_reply": "2024-12-22T17:30:09.368416Z"
+    },
+    "papermill": {
+     "duration": 0.01944,
+     "end_time": "2024-12-22T17:30:09.373130",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.353690",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "class CONFIG:\n",
+    "    target_col = \"responder_6\"\n",
+    "    lag_cols_original = [\"date_id\", \"symbol_id\"] + [f\"responder_{idx}\" for idx in range(9)]\n",
+    "    lag_cols_rename = { f\"responder_{idx}\" : f\"responder_{idx}_lag_1\" for idx in range(9)}\n",
+    "    valid_ratio = 0.05\n",
+    "    start_dt = 1100"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "7bd17568",
+   "metadata": {
+    "papermill": {
+     "duration": 0.007303,
+     "end_time": "2024-12-22T17:30:09.384849",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.377546",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# Load training data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "846dd6bd",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:30:09.398491Z",
+     "iopub.status.busy": "2024-12-22T17:30:09.397949Z",
+     "iopub.status.idle": "2024-12-22T17:30:09.442223Z",
+     "shell.execute_reply": "2024-12-22T17:30:09.439850Z"
+    },
+    "papermill": {
+     "duration": 0.054373,
+     "end_time": "2024-12-22T17:30:09.446676",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.392303",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "# Use last 2 parquets\n",
+    "train = pl.scan_parquet(\n",
+    "    f\"/kaggle/input/jane-street-real-time-market-data-forecasting/train.parquet\"\n",
+    ").select(\n",
+    "    pl.int_range(pl.len(), dtype=pl.UInt32).alias(\"id\"),\n",
+    "    pl.all(),\n",
+    ").with_columns(\n",
+    "    (pl.col(CONFIG.target_col)*2).cast(pl.Int32).alias(\"label\"),\n",
+    ").filter(\n",
+    "    pl.col(\"date_id\").gt(CONFIG.start_dt)\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "551de94d",
+   "metadata": {
+    "papermill": {
+     "duration": 0.007667,
+     "end_time": "2024-12-22T17:30:09.466672",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.459005",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "１\n",
+    "\n",
+    "pl.scan_parquet(...): Parquetファイルを読み込むための関数ですが、read_parquet と異なり、データをメモリに読み込まずにスキャンします。これは、非常に大きなファイルを扱う場合にメモリ効率を高めるための方法です。データは必要に応じて後から読み込まれます（遅延評価）。\n",
+    "\n",
+    "２\n",
+    "\n",
+    ".select(...): 読み込む列を選択します。\n",
+    "pl.int_range(pl.len(), dtype=pl.UInt32).alias(\"id\"): 新しい列 id を作成します。\n",
+    "pl.len(): データフレームの行数を取得します。\n",
+    "pl.int_range(...): 0 から行数までの整数のシーケンスを生成します。つまり、各行に一意のIDを付与します。\n",
+    "dtype=pl.UInt32: 生成する整数のデータ型を符号なし32ビット整数 (UInt32) に指定します。これにより、メモリ使用量を抑えることができます。\n",
+    ".alias(\"id\"): 生成された列に id という名前を付けます。\n",
+    "pl.all(): 他のすべての列も選択します。つまり、元のParquetファイルに含まれるすべての列も読み込みます。\n",
+    "\n",
+    "３\n",
+    "\n",
+    ".with_columns(...): 新しい列を追加または既存の列を変換します。\n",
+    "(pl.col(CONFIG.target_col)*2).cast(pl.Int32).alias(\"label\"): 新しい列 label を作成します。\n",
+    "CONFIG.target_col: 予測対象の列名が格納されている変数です。例えば、\"responder_6\" などが格納されていると想定されます。\n",
+    "pl.col(CONFIG.target_col): 指定された列を選択します。\n",
+    "*2: 選択された列の値を2倍にします。\n",
+    ".cast(pl.Int32): 結果を符号付き32ビット整数 (Int32) に型変換します。\n",
+    ".alias(\"label\"): 結果の列に label という名前を付けます。\n",
+    "\n",
+    "\n",
+    "４\n",
+    "\n",
+    ".filter(...): 指定された条件でデータをフィルタリングします。\n",
+    "pl.col(\"date_id\").gt(CONFIG.start_dt): date_id 列の値が CONFIG.start_dt より大きい行のみを選択します。CONFIG.start_dt は、データを使用する開始日を表す変数です。これにより、特定の期間以降のデータのみを使用するようにフィルタリングできます。\n",
+    "\n",
+    "まとめ\n",
+    "\n",
+    "まとめ\n",
+    "\n",
+    "このコードは、大きなParquetファイルを効率的に読み込み、以下の処理を行っています。\n",
+    "\n",
+    "各行に一意のID (id) を付与。\n",
+    "予測対象の列 (CONFIG.target_col) の値を2倍にして label 列として追加。\n",
+    "指定された開始日 (CONFIG.start_dt) 以降のデータのみを抽出。\n",
+    "scan_parquet を使用しているため、データはまだメモリに読み込まれていません。後続の処理で .collect() を呼び出すことで、データがメモリに読み込まれ、DataFrameとして操作できるようになります。この遅延評価により、メモリ使用量を大幅に削減できます。"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "419266dd",
+   "metadata": {
+    "papermill": {
+     "duration": 0.00597,
+     "end_time": "2024-12-22T17:30:09.482520",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.476550",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# Create Lags data from training data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "a26ce7d2",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:30:09.499694Z",
+     "iopub.status.busy": "2024-12-22T17:30:09.499148Z",
+     "iopub.status.idle": "2024-12-22T17:30:09.845225Z",
+     "shell.execute_reply": "2024-12-22T17:30:09.843804Z"
+    },
+    "papermill": {
+     "duration": 0.35944,
+     "end_time": "2024-12-22T17:30:09.847660",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.488220",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<h4>NAIVE QUERY PLAN</h4><p>run <b>LazyFrame.show_graph()</b> to see the optimized version</p><?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n",
+       "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n",
+       " \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+       "<!-- Generated by graphviz version 12.0.0 (20240803.0821)\n",
+       " -->\n",
+       "<!-- Title: polars_query Pages: 1 -->\n",
+       "<svg width=\"2108pt\" height=\"578pt\"\n",
+       " viewBox=\"0.00 0.00 2107.50 578.25\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n",
+       "<g id=\"graph0\" class=\"graph\" transform=\"scale(1 1) rotate(0) translate(4 574.25)\">\n",
+       "<title>polars_query</title>\n",
+       "<polygon fill=\"white\" stroke=\"none\" points=\"-4,4 -4,-574.25 2103.5,-574.25 2103.5,4 -4,4\"/>\n",
+       "<!-- p1 -->\n",
+       "<g id=\"node1\" class=\"node\">\n",
+       "<title>p1</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"2099.5,-570.25 0,-570.25 0,-510.5 2099.5,-510.5 2099.5,-570.25\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-552.95\" font-family=\"Times,serif\" font-size=\"14.00\">AGG [col(&quot;responder_0_lag_1&quot;).last(), col(&quot;responder_1_lag_1&quot;).last(), col(&quot;responder_2_lag_1&quot;).last(), col(&quot;responder_3_lag_1&quot;).last(), col(&quot;responder_4_lag_1&quot;).last(), col(&quot;responder_5_lag_1&quot;).last(), col(&quot;responder_6_lag_1&quot;).last(), col(&quot;responder_7_lag_1&quot;).last(), col(&quot;responder_8_lag_1&quot;).last()]</text>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-535.7\" font-family=\"Times,serif\" font-size=\"14.00\">BY</text>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-518.45\" font-family=\"Times,serif\" font-size=\"14.00\">[col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p2 -->\n",
+       "<g id=\"node2\" class=\"node\">\n",
+       "<title>p2</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1262.12,-474.5 837.38,-474.5 837.38,-438.5 1262.12,-438.5 1262.12,-474.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-451.82\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;date_id&quot;)) + (1)].alias(&quot;date_id&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p1&#45;&#45;p2 -->\n",
+       "<g id=\"edge1\" class=\"edge\">\n",
+       "<title>p1&#45;&#45;p2</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-510.28C1049.75,-498.33 1049.75,-484.9 1049.75,-474.59\"/>\n",
+       "</g>\n",
+       "<!-- p3 -->\n",
+       "<g id=\"node3\" class=\"node\">\n",
+       "<title>p3</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1091.5,-402.5 1008,-402.5 1008,-366.5 1091.5,-366.5 1091.5,-402.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-379.82\" font-family=\"Times,serif\" font-size=\"14.00\">RENAME</text>\n",
+       "</g>\n",
+       "<!-- p2&#45;&#45;p3 -->\n",
+       "<g id=\"edge2\" class=\"edge\">\n",
+       "<title>p2&#45;&#45;p3</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-438.2C1049.75,-427.35 1049.75,-413.42 1049.75,-402.6\"/>\n",
+       "</g>\n",
+       "<!-- p4 -->\n",
+       "<g id=\"node4\" class=\"node\">\n",
+       "<title>p4</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1084.75,-330.5 1014.75,-330.5 1014.75,-294.5 1084.75,-294.5 1084.75,-330.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-307.82\" font-family=\"Times,serif\" font-size=\"14.00\">π 11/11</text>\n",
+       "</g>\n",
+       "<!-- p3&#45;&#45;p4 -->\n",
+       "<g id=\"edge3\" class=\"edge\">\n",
+       "<title>p3&#45;&#45;p4</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-366.2C1049.75,-355.35 1049.75,-341.42 1049.75,-330.6\"/>\n",
+       "</g>\n",
+       "<!-- p5 -->\n",
+       "<g id=\"node5\" class=\"node\">\n",
+       "<title>p5</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1190.5,-258.5 909,-258.5 909,-222.5 1190.5,-222.5 1190.5,-258.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-235.82\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n",
+       "</g>\n",
+       "<!-- p4&#45;&#45;p5 -->\n",
+       "<g id=\"edge4\" class=\"edge\">\n",
+       "<title>p4&#45;&#45;p5</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-294.2C1049.75,-283.35 1049.75,-269.42 1049.75,-258.6\"/>\n",
+       "</g>\n",
+       "<!-- p6 -->\n",
+       "<g id=\"node6\" class=\"node\">\n",
+       "<title>p6</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1339.75,-186.5 759.75,-186.5 759.75,-150.5 1339.75,-150.5 1339.75,-186.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-163.82\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p5&#45;&#45;p6 -->\n",
+       "<g id=\"edge5\" class=\"edge\">\n",
+       "<title>p5&#45;&#45;p6</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-222.2C1049.75,-211.35 1049.75,-197.42 1049.75,-186.6\"/>\n",
+       "</g>\n",
+       "<!-- p7 -->\n",
+       "<g id=\"node7\" class=\"node\">\n",
+       "<title>p7</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1084.75,-114.5 1014.75,-114.5 1014.75,-78.5 1084.75,-78.5 1084.75,-114.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-91.83\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n",
+       "</g>\n",
+       "<!-- p6&#45;&#45;p7 -->\n",
+       "<g id=\"edge6\" class=\"edge\">\n",
+       "<title>p6&#45;&#45;p7</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-150.2C1049.75,-139.35 1049.75,-125.42 1049.75,-114.6\"/>\n",
+       "</g>\n",
+       "<!-- p8 -->\n",
+       "<g id=\"node8\" class=\"node\">\n",
+       "<title>p8</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1554.25,-42.5 545.25,-42.5 545.25,0 1554.25,0 1554.25,-42.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-25.2\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n",
+       "<text text-anchor=\"middle\" x=\"1049.75\" y=\"-7.95\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n",
+       "</g>\n",
+       "<!-- p7&#45;&#45;p8 -->\n",
+       "<g id=\"edge7\" class=\"edge\">\n",
+       "<title>p7&#45;&#45;p8</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1049.75,-78.14C1049.75,-67.56 1049.75,-53.99 1049.75,-42.87\"/>\n",
+       "</g>\n",
+       "</g>\n",
+       "</svg>\n"
+      ],
+      "text/plain": [
+       "<LazyFrame at 0x7F9B79060970>"
+      ]
+     },
+     "execution_count": 4,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "lags = train.select(pl.col(CONFIG.lag_cols_original))\n",
+    "lags = lags.rename(CONFIG.lag_cols_rename)\n",
+    "lags = lags.with_columns(\n",
+    "    date_id = pl.col('date_id') + 1,  # lagged by 1 day\n",
+    "    )\n",
+    "lags = lags.group_by([\"date_id\", \"symbol_id\"], maintain_order=True).last()  # pick up last record of previous date\n",
+    "lags"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "edb81904",
+   "metadata": {
+    "papermill": {
+     "duration": 0.004159,
+     "end_time": "2024-12-22T17:30:09.856668",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.852509",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "\n",
+    ".select(pl.col(CONFIG.lag_cols_original)): train データフレームから、遅延特徴量として使用する列 (CONFIG.lag_cols_original) を選択します。\n",
+    "\n",
+    ".rename(CONFIG.lag_cols_rename): 選択された列の名前を CONFIG.lag_cols_rename 辞書に従って変更します。元の名前 (responder_X) が \"responder_X_lag_1\" に置き換えられます。\n",
+    "\n",
+    ".with_columns(date_id = pl.col('date_id') + 1): 新しい列 date_id を追加し、元の date_id に 1 を加算します。これにより、1 日遅れのデータを示すようにします。\n",
+    "\n",
+    ".group_by([\"date_id\", \"symbol_id\"], maintain_order=True).last(): date_id と symbol_id でグループ化し、各グループの最後のレコードのみ残します (last())。これにより、1 日前の同じシンボルIDのデータを取得します。\n",
+    "\n",
+    "lags: 処理後の遅延特徴量データフレーム lags が得られます。\n",
+    "\n",
+    "まとめ\n",
+    "\n",
+    "このコードは、トレーニングデータ (train) から、1 日遅れのレスポンダー変数などを使用した遅延特徴量を生成しています。遅延特徴量は、過去の情報を取り込むことで予測精度向上に役立つ可能性があります。"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "0770fc67",
+   "metadata": {
+    "papermill": {
+     "duration": 0.004012,
+     "end_time": "2024-12-22T17:30:09.864935",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.860923",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# Merge training data and lags data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "fd029b23",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:30:09.875444Z",
+     "iopub.status.busy": "2024-12-22T17:30:09.874958Z",
+     "iopub.status.idle": "2024-12-22T17:30:09.911052Z",
+     "shell.execute_reply": "2024-12-22T17:30:09.909807Z"
+    },
+    "papermill": {
+     "duration": 0.044457,
+     "end_time": "2024-12-22T17:30:09.913690",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.869233",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<h4>NAIVE QUERY PLAN</h4><p>run <b>LazyFrame.show_graph()</b> to see the optimized version</p><?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n",
+       "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n",
+       " \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+       "<!-- Generated by graphviz version 12.0.0 (20240803.0821)\n",
+       " -->\n",
+       "<!-- Title: polars_query Pages: 1 -->\n",
+       "<svg width=\"2771pt\" height=\"681pt\"\n",
+       " viewBox=\"0.00 0.00 2771.25 680.50\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n",
+       "<g id=\"graph0\" class=\"graph\" transform=\"scale(1 1) rotate(0) translate(4 676.5)\">\n",
+       "<title>polars_query</title>\n",
+       "<polygon fill=\"white\" stroke=\"none\" points=\"-4,4 -4,-676.5 2767.25,-676.5 2767.25,4 -4,4\"/>\n",
+       "<!-- p1 -->\n",
+       "<g id=\"node1\" class=\"node\">\n",
+       "<title>p1</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1254.12,-672.5 962.88,-672.5 962.88,-612.75 1254.12,-612.75 1254.12,-672.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1108.5\" y=\"-655.2\" font-family=\"Times,serif\" font-size=\"14.00\">JOIN LEFT</text>\n",
+       "<text text-anchor=\"middle\" x=\"1108.5\" y=\"-637.95\" font-family=\"Times,serif\" font-size=\"14.00\">left: [col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)];</text>\n",
+       "<text text-anchor=\"middle\" x=\"1108.5\" y=\"-620.7\" font-family=\"Times,serif\" font-size=\"14.00\">right: [col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p2 -->\n",
+       "<g id=\"node2\" class=\"node\">\n",
+       "<title>p2</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"645.25,-564.88 363.75,-564.88 363.75,-528.88 645.25,-528.88 645.25,-564.88\"/>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-542.2\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n",
+       "</g>\n",
+       "<!-- p1&#45;&#45;p2 -->\n",
+       "<g id=\"edge1\" class=\"edge\">\n",
+       "<title>p1&#45;&#45;p2</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M962.54,-622.59C873.39,-610.51 757.17,-593.96 654.5,-576.75 633.97,-573.31 611.92,-569.26 591.23,-565.31\"/>\n",
+       "</g>\n",
+       "<!-- p6 -->\n",
+       "<g id=\"node6\" class=\"node\">\n",
+       "<title>p6</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"2763.25,-576.75 663.75,-576.75 663.75,-517 2763.25,-517 2763.25,-576.75\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-559.45\" font-family=\"Times,serif\" font-size=\"14.00\">AGG [col(&quot;responder_0_lag_1&quot;).last(), col(&quot;responder_1_lag_1&quot;).last(), col(&quot;responder_2_lag_1&quot;).last(), col(&quot;responder_3_lag_1&quot;).last(), col(&quot;responder_4_lag_1&quot;).last(), col(&quot;responder_5_lag_1&quot;).last(), col(&quot;responder_6_lag_1&quot;).last(), col(&quot;responder_7_lag_1&quot;).last(), col(&quot;responder_8_lag_1&quot;).last()]</text>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-542.2\" font-family=\"Times,serif\" font-size=\"14.00\">BY</text>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-524.95\" font-family=\"Times,serif\" font-size=\"14.00\">[col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p1&#45;&#45;p6 -->\n",
+       "<g id=\"edge5\" class=\"edge\">\n",
+       "<title>p1&#45;&#45;p6</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1254.57,-618.99C1335.52,-606.45 1437.09,-590.71 1524.08,-577.23\"/>\n",
+       "</g>\n",
+       "<!-- p3 -->\n",
+       "<g id=\"node3\" class=\"node\">\n",
+       "<title>p3</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"794.5,-481 214.5,-481 214.5,-445 794.5,-445 794.5,-481\"/>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-458.32\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p2&#45;&#45;p3 -->\n",
+       "<g id=\"edge2\" class=\"edge\">\n",
+       "<title>p2&#45;&#45;p3</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M504.5,-528.51C504.5,-514.62 504.5,-495.23 504.5,-481.34\"/>\n",
+       "</g>\n",
+       "<!-- p4 -->\n",
+       "<g id=\"node4\" class=\"node\">\n",
+       "<title>p4</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"539.5,-409 469.5,-409 469.5,-373 539.5,-373 539.5,-409\"/>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-386.32\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n",
+       "</g>\n",
+       "<!-- p3&#45;&#45;p4 -->\n",
+       "<g id=\"edge3\" class=\"edge\">\n",
+       "<title>p3&#45;&#45;p4</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M504.5,-444.7C504.5,-433.85 504.5,-419.92 504.5,-409.1\"/>\n",
+       "</g>\n",
+       "<!-- p5 -->\n",
+       "<g id=\"node5\" class=\"node\">\n",
+       "<title>p5</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1009,-337 0,-337 0,-294.5 1009,-294.5 1009,-337\"/>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-319.7\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-302.45\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n",
+       "</g>\n",
+       "<!-- p4&#45;&#45;p5 -->\n",
+       "<g id=\"edge4\" class=\"edge\">\n",
+       "<title>p4&#45;&#45;p5</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M504.5,-372.64C504.5,-362.06 504.5,-348.49 504.5,-337.37\"/>\n",
+       "</g>\n",
+       "<!-- p7 -->\n",
+       "<g id=\"node7\" class=\"node\">\n",
+       "<title>p7</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1925.88,-481 1501.12,-481 1501.12,-445 1925.88,-445 1925.88,-481\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-458.32\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;date_id&quot;)) + (1)].alias(&quot;date_id&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p6&#45;&#45;p7 -->\n",
+       "<g id=\"edge6\" class=\"edge\">\n",
+       "<title>p6&#45;&#45;p7</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-516.78C1713.5,-504.83 1713.5,-491.4 1713.5,-481.09\"/>\n",
+       "</g>\n",
+       "<!-- p8 -->\n",
+       "<g id=\"node8\" class=\"node\">\n",
+       "<title>p8</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1755.25,-409 1671.75,-409 1671.75,-373 1755.25,-373 1755.25,-409\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-386.32\" font-family=\"Times,serif\" font-size=\"14.00\">RENAME</text>\n",
+       "</g>\n",
+       "<!-- p7&#45;&#45;p8 -->\n",
+       "<g id=\"edge7\" class=\"edge\">\n",
+       "<title>p7&#45;&#45;p8</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-444.7C1713.5,-433.85 1713.5,-419.92 1713.5,-409.1\"/>\n",
+       "</g>\n",
+       "<!-- p9 -->\n",
+       "<g id=\"node9\" class=\"node\">\n",
+       "<title>p9</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1748.5,-333.75 1678.5,-333.75 1678.5,-297.75 1748.5,-297.75 1748.5,-333.75\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-311.07\" font-family=\"Times,serif\" font-size=\"14.00\">π 11/11</text>\n",
+       "</g>\n",
+       "<!-- p8&#45;&#45;p9 -->\n",
+       "<g id=\"edge8\" class=\"edge\">\n",
+       "<title>p8&#45;&#45;p9</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-372.64C1713.5,-361.05 1713.5,-345.86 1713.5,-334.24\"/>\n",
+       "</g>\n",
+       "<!-- p10 -->\n",
+       "<g id=\"node10\" class=\"node\">\n",
+       "<title>p10</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1854.25,-258.5 1572.75,-258.5 1572.75,-222.5 1854.25,-222.5 1854.25,-258.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-235.82\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n",
+       "</g>\n",
+       "<!-- p9&#45;&#45;p10 -->\n",
+       "<g id=\"edge9\" class=\"edge\">\n",
+       "<title>p9&#45;&#45;p10</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-297.39C1713.5,-285.8 1713.5,-270.61 1713.5,-258.99\"/>\n",
+       "</g>\n",
+       "<!-- p11 -->\n",
+       "<g id=\"node11\" class=\"node\">\n",
+       "<title>p11</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"2003.5,-186.5 1423.5,-186.5 1423.5,-150.5 2003.5,-150.5 2003.5,-186.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-163.82\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p10&#45;&#45;p11 -->\n",
+       "<g id=\"edge10\" class=\"edge\">\n",
+       "<title>p10&#45;&#45;p11</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-222.2C1713.5,-211.35 1713.5,-197.42 1713.5,-186.6\"/>\n",
+       "</g>\n",
+       "<!-- p12 -->\n",
+       "<g id=\"node12\" class=\"node\">\n",
+       "<title>p12</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1748.5,-114.5 1678.5,-114.5 1678.5,-78.5 1748.5,-78.5 1748.5,-114.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-91.83\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n",
+       "</g>\n",
+       "<!-- p11&#45;&#45;p12 -->\n",
+       "<g id=\"edge11\" class=\"edge\">\n",
+       "<title>p11&#45;&#45;p12</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-150.2C1713.5,-139.35 1713.5,-125.42 1713.5,-114.6\"/>\n",
+       "</g>\n",
+       "<!-- p13 -->\n",
+       "<g id=\"node13\" class=\"node\">\n",
+       "<title>p13</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"2218,-42.5 1209,-42.5 1209,0 2218,0 2218,-42.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-25.2\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-7.95\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n",
+       "</g>\n",
+       "<!-- p12&#45;&#45;p13 -->\n",
+       "<g id=\"edge12\" class=\"edge\">\n",
+       "<title>p12&#45;&#45;p13</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-78.14C1713.5,-67.56 1713.5,-53.99 1713.5,-42.87\"/>\n",
+       "</g>\n",
+       "</g>\n",
+       "</svg>\n"
+      ],
+      "text/plain": [
+       "<LazyFrame at 0x7F9BA5D28940>"
+      ]
+     },
+     "execution_count": 5,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "train = train.join(lags, on=[\"date_id\", \"symbol_id\"],  how=\"left\")\n",
+    "train"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "06c72eb1",
+   "metadata": {
+    "papermill": {
+     "duration": 0.004549,
+     "end_time": "2024-12-22T17:30:09.923274",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.918725",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "train.join(...): train データフレームに対して結合操作を行います。\n",
+    "\n",
+    "lags: 結合する相手のデータフレームです。これは、前述のコードで生成された遅延特徴量を含むデータフレームです。\n",
+    "\n",
+    "on=[\"date_id\", \"symbol_id\"]: 結合キーを指定します。train と lags の両方のデータフレームにおいて、date_id と symbol_id の値が一致する行同士を結合します。つまり、同じ日付とシンボルのデータ同士が結合されます。\n",
+    "\n",
+    "how=\"left\": 結合方法を指定します。\"left\" は左結合を意味します。左結合では、左側のデータフレーム (train) のすべての行が結果に含まれます。結合キーが一致する行が右側のデータフレーム (lags) に存在する場合は、それらの行が結合されます。一致する行がない場合は、右側の列は欠損値 (NaN/Null) で埋められます。\n",
+    "\n",
+    "このコードの目的\n",
+    "\n",
+    "このコードの目的は、train データフレームに遅延特徴量 (lags) を追加することです。これにより、モデルは過去のデータに基づいて予測を行うことができるようになります。左結合を使用しているため、train のすべてのデータが保持され、遅延特徴量が利用できない場合は欠損値として扱われます。\n",
+    "\n",
+    "まとめ\n",
+    "\n",
+    "train.join(lags, on=[\"date_id\", \"symbol_id\"], how=\"left\") は、train データフレームに lags データフレームを左結合し、date_id と symbol_id を結合キーとして使用することで、各 train データに1日前の同じシンボルのレスポンダー変数の値（遅延特徴量）を追加しています。"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d01840c2",
+   "metadata": {
+    "papermill": {
+     "duration": 0.004446,
+     "end_time": "2024-12-22T17:30:09.932618",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.928172",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# Split training data and validation data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "43d2b20e",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:30:09.943792Z",
+     "iopub.status.busy": "2024-12-22T17:30:09.943380Z",
+     "iopub.status.idle": "2024-12-22T17:30:14.177382Z",
+     "shell.execute_reply": "2024-12-22T17:30:14.176059Z"
+    },
+    "papermill": {
+     "duration": 4.242783,
+     "end_time": "2024-12-22T17:30:14.179994",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:09.937211",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      " len_train = 22104280\n",
+      "\n",
+      " len_ofl_mdl = 20999066\n",
+      "\n",
+      "---> Last offline train date = 1669\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "len_train   = train.select(pl.col(\"date_id\")).collect().shape[0]\n",
+    "valid_records = int(len_train * CONFIG.valid_ratio)\n",
+    "len_ofl_mdl = len_train - valid_records\n",
+    "last_tr_dt  = train.select(pl.col(\"date_id\")).collect().row(len_ofl_mdl)[0]\n",
+    "\n",
+    "print(f\"\\n len_train = {len_train}\")\n",
+    "print(f\"\\n len_ofl_mdl = {len_ofl_mdl}\")\n",
+    "print(f\"\\n---> Last offline train date = {last_tr_dt}\\n\")\n",
+    "\n",
+    "training_data = train.filter(pl.col(\"date_id\").le(last_tr_dt))\n",
+    "validation_data   = train.filter(pl.col(\"date_id\").gt(last_tr_dt))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "b4aca516",
+   "metadata": {
+    "papermill": {
+     "duration": 0.004885,
+     "end_time": "2024-12-22T17:30:14.189994",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:14.185109",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "train.select(pl.col(\"date_id\")): train データフレームから \"date_id\" 列だけ選択します。\n",
+    "\n",
+    ".collect(): .shape[0] を使う前に、遅延評価を解除するためにデータをメモリに読み込みます。\n",
+    "\n",
+    ".shape[0]: データフレームの行数を取得します。\n",
+    "\n",
+    "CONFIG.valid_ratio: バリデーションデータの割合が格納されている変数です (例えば、0.05)。\n",
+    "\n",
+    "int(len_train * CONFIG.valid_ratio): len_train に CONFIG.valid_ratio を掛け、バリデーションデータのレコード数を計算します。int() で整数型に変換します。\n",
+    "\n",
+    "len_train: 1. で取得したトレーニングデータの全長。\n",
+    "\n",
+    "valid_records: 2. で計算したバリデーションデータのレコード数。\n",
+    "\n",
+    "len_train - valid_records: トレーニングデータからバリデーションデータの分を引いて、オフラインモデルの訓練データの長さを計算します。\n",
+    "\n",
+    "train.select(pl.col(\"date_id\")): 1. と同様に、\"date_id\" 列だけ選択します。\n",
+    "\n",
+    ".collect(): .row() を使う前に、遅延評価を解除するためにデータをメモリに読み込みます。\n",
+    "\n",
+    ".row(len_ofl_mdl): 行番号 len_ofl_mdl の行を取得します。これは、オフラインモデルの訓練データの最後の行にあたります。\n",
+    "\n",
+    "[0]: 取得した行から、\"date_id\" 列の値 (つまり、日付) を取り出します。\n",
+    "\n",
+    "le: less than or equal to の略で、「以下」を意味します。つまり、a le b は「a は b 以下」(a <= b) と同じ意味です。\n",
+    "\n",
+    "gt: greater than の略で、「より大きい」を意味します。つまり、a gt b は「a は b より大きい」(a > b) と同じ意味です。\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "a52ad0b3",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:30:14.202286Z",
+     "iopub.status.busy": "2024-12-22T17:30:14.201285Z",
+     "iopub.status.idle": "2024-12-22T17:30:14.232191Z",
+     "shell.execute_reply": "2024-12-22T17:30:14.230845Z"
+    },
+    "papermill": {
+     "duration": 0.039878,
+     "end_time": "2024-12-22T17:30:14.234876",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:14.194998",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<h4>NAIVE QUERY PLAN</h4><p>run <b>LazyFrame.show_graph()</b> to see the optimized version</p><?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n",
+       "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n",
+       " \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+       "<!-- Generated by graphviz version 12.0.0 (20240803.0821)\n",
+       " -->\n",
+       "<!-- Title: polars_query Pages: 1 -->\n",
+       "<svg width=\"2771pt\" height=\"753pt\"\n",
+       " viewBox=\"0.00 0.00 2771.25 752.50\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n",
+       "<g id=\"graph0\" class=\"graph\" transform=\"scale(1 1) rotate(0) translate(4 748.5)\">\n",
+       "<title>polars_query</title>\n",
+       "<polygon fill=\"white\" stroke=\"none\" points=\"-4,4 -4,-748.5 2767.25,-748.5 2767.25,4 -4,4\"/>\n",
+       "<!-- p1 -->\n",
+       "<g id=\"node1\" class=\"node\">\n",
+       "<title>p1</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1249.25,-744.5 967.75,-744.5 967.75,-708.5 1249.25,-708.5 1249.25,-744.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1108.5\" y=\"-721.83\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1669)]</text>\n",
+       "</g>\n",
+       "<!-- p2 -->\n",
+       "<g id=\"node2\" class=\"node\">\n",
+       "<title>p2</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1254.12,-672.5 962.88,-672.5 962.88,-612.75 1254.12,-612.75 1254.12,-672.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1108.5\" y=\"-655.2\" font-family=\"Times,serif\" font-size=\"14.00\">JOIN LEFT</text>\n",
+       "<text text-anchor=\"middle\" x=\"1108.5\" y=\"-637.95\" font-family=\"Times,serif\" font-size=\"14.00\">left: [col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)];</text>\n",
+       "<text text-anchor=\"middle\" x=\"1108.5\" y=\"-620.7\" font-family=\"Times,serif\" font-size=\"14.00\">right: [col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p1&#45;&#45;p2 -->\n",
+       "<g id=\"edge1\" class=\"edge\">\n",
+       "<title>p1&#45;&#45;p2</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1108.5,-708.14C1108.5,-697.9 1108.5,-684.69 1108.5,-672.89\"/>\n",
+       "</g>\n",
+       "<!-- p3 -->\n",
+       "<g id=\"node3\" class=\"node\">\n",
+       "<title>p3</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"645.25,-564.88 363.75,-564.88 363.75,-528.88 645.25,-528.88 645.25,-564.88\"/>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-542.2\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n",
+       "</g>\n",
+       "<!-- p2&#45;&#45;p3 -->\n",
+       "<g id=\"edge2\" class=\"edge\">\n",
+       "<title>p2&#45;&#45;p3</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M962.54,-622.59C873.39,-610.51 757.17,-593.96 654.5,-576.75 633.97,-573.31 611.92,-569.26 591.23,-565.31\"/>\n",
+       "</g>\n",
+       "<!-- p7 -->\n",
+       "<g id=\"node7\" class=\"node\">\n",
+       "<title>p7</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"2763.25,-576.75 663.75,-576.75 663.75,-517 2763.25,-517 2763.25,-576.75\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-559.45\" font-family=\"Times,serif\" font-size=\"14.00\">AGG [col(&quot;responder_0_lag_1&quot;).last(), col(&quot;responder_1_lag_1&quot;).last(), col(&quot;responder_2_lag_1&quot;).last(), col(&quot;responder_3_lag_1&quot;).last(), col(&quot;responder_4_lag_1&quot;).last(), col(&quot;responder_5_lag_1&quot;).last(), col(&quot;responder_6_lag_1&quot;).last(), col(&quot;responder_7_lag_1&quot;).last(), col(&quot;responder_8_lag_1&quot;).last()]</text>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-542.2\" font-family=\"Times,serif\" font-size=\"14.00\">BY</text>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-524.95\" font-family=\"Times,serif\" font-size=\"14.00\">[col(&quot;date_id&quot;), col(&quot;symbol_id&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p2&#45;&#45;p7 -->\n",
+       "<g id=\"edge6\" class=\"edge\">\n",
+       "<title>p2&#45;&#45;p7</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1254.57,-618.99C1335.52,-606.45 1437.09,-590.71 1524.08,-577.23\"/>\n",
+       "</g>\n",
+       "<!-- p4 -->\n",
+       "<g id=\"node4\" class=\"node\">\n",
+       "<title>p4</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"794.5,-481 214.5,-481 214.5,-445 794.5,-445 794.5,-481\"/>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-458.32\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p3&#45;&#45;p4 -->\n",
+       "<g id=\"edge3\" class=\"edge\">\n",
+       "<title>p3&#45;&#45;p4</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M504.5,-528.51C504.5,-514.62 504.5,-495.23 504.5,-481.34\"/>\n",
+       "</g>\n",
+       "<!-- p5 -->\n",
+       "<g id=\"node5\" class=\"node\">\n",
+       "<title>p5</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"539.5,-409 469.5,-409 469.5,-373 539.5,-373 539.5,-409\"/>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-386.32\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n",
+       "</g>\n",
+       "<!-- p4&#45;&#45;p5 -->\n",
+       "<g id=\"edge4\" class=\"edge\">\n",
+       "<title>p4&#45;&#45;p5</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M504.5,-444.7C504.5,-433.85 504.5,-419.92 504.5,-409.1\"/>\n",
+       "</g>\n",
+       "<!-- p6 -->\n",
+       "<g id=\"node6\" class=\"node\">\n",
+       "<title>p6</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1009,-337 0,-337 0,-294.5 1009,-294.5 1009,-337\"/>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-319.7\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n",
+       "<text text-anchor=\"middle\" x=\"504.5\" y=\"-302.45\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n",
+       "</g>\n",
+       "<!-- p5&#45;&#45;p6 -->\n",
+       "<g id=\"edge5\" class=\"edge\">\n",
+       "<title>p5&#45;&#45;p6</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M504.5,-372.64C504.5,-362.06 504.5,-348.49 504.5,-337.37\"/>\n",
+       "</g>\n",
+       "<!-- p8 -->\n",
+       "<g id=\"node8\" class=\"node\">\n",
+       "<title>p8</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1925.88,-481 1501.12,-481 1501.12,-445 1925.88,-445 1925.88,-481\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-458.32\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;date_id&quot;)) + (1)].alias(&quot;date_id&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p7&#45;&#45;p8 -->\n",
+       "<g id=\"edge7\" class=\"edge\">\n",
+       "<title>p7&#45;&#45;p8</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-516.78C1713.5,-504.83 1713.5,-491.4 1713.5,-481.09\"/>\n",
+       "</g>\n",
+       "<!-- p9 -->\n",
+       "<g id=\"node9\" class=\"node\">\n",
+       "<title>p9</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1755.25,-409 1671.75,-409 1671.75,-373 1755.25,-373 1755.25,-409\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-386.32\" font-family=\"Times,serif\" font-size=\"14.00\">RENAME</text>\n",
+       "</g>\n",
+       "<!-- p8&#45;&#45;p9 -->\n",
+       "<g id=\"edge8\" class=\"edge\">\n",
+       "<title>p8&#45;&#45;p9</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-444.7C1713.5,-433.85 1713.5,-419.92 1713.5,-409.1\"/>\n",
+       "</g>\n",
+       "<!-- p10 -->\n",
+       "<g id=\"node10\" class=\"node\">\n",
+       "<title>p10</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1748.5,-333.75 1678.5,-333.75 1678.5,-297.75 1748.5,-297.75 1748.5,-333.75\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-311.07\" font-family=\"Times,serif\" font-size=\"14.00\">π 11/11</text>\n",
+       "</g>\n",
+       "<!-- p9&#45;&#45;p10 -->\n",
+       "<g id=\"edge9\" class=\"edge\">\n",
+       "<title>p9&#45;&#45;p10</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-372.64C1713.5,-361.05 1713.5,-345.86 1713.5,-334.24\"/>\n",
+       "</g>\n",
+       "<!-- p11 -->\n",
+       "<g id=\"node11\" class=\"node\">\n",
+       "<title>p11</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1854.25,-258.5 1572.75,-258.5 1572.75,-222.5 1854.25,-222.5 1854.25,-258.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-235.82\" font-family=\"Times,serif\" font-size=\"14.00\">FILTER BY [(col(&quot;date_id&quot;)) &gt; (1100)]</text>\n",
+       "</g>\n",
+       "<!-- p10&#45;&#45;p11 -->\n",
+       "<g id=\"edge10\" class=\"edge\">\n",
+       "<title>p10&#45;&#45;p11</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-297.39C1713.5,-285.8 1713.5,-270.61 1713.5,-258.99\"/>\n",
+       "</g>\n",
+       "<!-- p12 -->\n",
+       "<g id=\"node12\" class=\"node\">\n",
+       "<title>p12</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"2003.5,-186.5 1423.5,-186.5 1423.5,-150.5 2003.5,-150.5 2003.5,-186.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-163.82\" font-family=\"Times,serif\" font-size=\"14.00\">WITH COLUMNS [[(col(&quot;responder_6&quot;)) * (2.0)].strict_cast(Int32).alias(&quot;label&quot;)]</text>\n",
+       "</g>\n",
+       "<!-- p11&#45;&#45;p12 -->\n",
+       "<g id=\"edge11\" class=\"edge\">\n",
+       "<title>p11&#45;&#45;p12</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-222.2C1713.5,-211.35 1713.5,-197.42 1713.5,-186.6\"/>\n",
+       "</g>\n",
+       "<!-- p13 -->\n",
+       "<g id=\"node13\" class=\"node\">\n",
+       "<title>p13</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"1748.5,-114.5 1678.5,-114.5 1678.5,-78.5 1748.5,-78.5 1748.5,-114.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-91.83\" font-family=\"Times,serif\" font-size=\"14.00\">π 94/94</text>\n",
+       "</g>\n",
+       "<!-- p12&#45;&#45;p13 -->\n",
+       "<g id=\"edge12\" class=\"edge\">\n",
+       "<title>p12&#45;&#45;p13</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-150.2C1713.5,-139.35 1713.5,-125.42 1713.5,-114.6\"/>\n",
+       "</g>\n",
+       "<!-- p14 -->\n",
+       "<g id=\"node14\" class=\"node\">\n",
+       "<title>p14</title>\n",
+       "<polygon fill=\"none\" stroke=\"black\" points=\"2218,-42.5 1209,-42.5 1209,0 2218,0 2218,-42.5\"/>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-25.2\" font-family=\"Times,serif\" font-size=\"14.00\">Parquet SCAN [/kaggle/input/jane&#45;street&#45;real&#45;time&#45;market&#45;data&#45;forecasting/train.parquet/partition_id=0/part&#45;0.parquet, ... 9 other sources]</text>\n",
+       "<text text-anchor=\"middle\" x=\"1713.5\" y=\"-7.95\" font-family=\"Times,serif\" font-size=\"14.00\">π */93;</text>\n",
+       "</g>\n",
+       "<!-- p13&#45;&#45;p14 -->\n",
+       "<g id=\"edge13\" class=\"edge\">\n",
+       "<title>p13&#45;&#45;p14</title>\n",
+       "<path fill=\"none\" stroke=\"black\" d=\"M1713.5,-78.14C1713.5,-67.56 1713.5,-53.99 1713.5,-42.87\"/>\n",
+       "</g>\n",
+       "</g>\n",
+       "</svg>\n"
+      ],
+      "text/plain": [
+       "<LazyFrame at 0x7F9BA5D28C10>"
+      ]
+     },
+     "execution_count": 7,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "validation_data"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cd36d8b5",
+   "metadata": {
+    "papermill": {
+     "duration": 0.005141,
+     "end_time": "2024-12-22T17:30:14.245846",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:14.240705",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# Save data as parquets"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "c30cc760",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:30:14.258922Z",
+     "iopub.status.busy": "2024-12-22T17:30:14.258348Z",
+     "iopub.status.idle": "2024-12-22T17:32:08.364235Z",
+     "shell.execute_reply": "2024-12-22T17:32:08.361224Z"
+    },
+    "papermill": {
+     "duration": 114.119278,
+     "end_time": "2024-12-22T17:32:08.370441",
+     "exception": false,
+     "start_time": "2024-12-22T17:30:14.251163",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "training_data.collect().\\\n",
+    "write_parquet(\n",
+    "    f\"training.parquet\", partition_by = \"date_id\",\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "d613fd4c",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:32:08.388223Z",
+     "iopub.status.busy": "2024-12-22T17:32:08.387371Z",
+     "iopub.status.idle": "2024-12-22T17:32:08.437367Z",
+     "shell.execute_reply": "2024-12-22T17:32:08.436195Z"
+    },
+    "papermill": {
+     "duration": 0.061406,
+     "end_time": "2024-12-22T17:32:08.441141",
+     "exception": false,
+     "start_time": "2024-12-22T17:32:08.379735",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div><style>\n",
+       ".dataframe > thead > tr,\n",
+       ".dataframe > tbody > tr {\n",
+       "  text-align: right;\n",
+       "  white-space: pre-wrap;\n",
+       "}\n",
+       "</style>\n",
+       "<small>shape: (37_752, 104)</small><table border=\"1\" class=\"dataframe\"><thead><tr><th>id</th><th>date_id</th><th>time_id</th><th>symbol_id</th><th>weight</th><th>feature_00</th><th>feature_01</th><th>feature_02</th><th>feature_03</th><th>feature_04</th><th>feature_05</th><th>feature_06</th><th>feature_07</th><th>feature_08</th><th>feature_09</th><th>feature_10</th><th>feature_11</th><th>feature_12</th><th>feature_13</th><th>feature_14</th><th>feature_15</th><th>feature_16</th><th>feature_17</th><th>feature_18</th><th>feature_19</th><th>feature_20</th><th>feature_21</th><th>feature_22</th><th>feature_23</th><th>feature_24</th><th>feature_25</th><th>feature_26</th><th>feature_27</th><th>feature_28</th><th>feature_29</th><th>feature_30</th><th>feature_31</th><th>&hellip;</th><th>feature_62</th><th>feature_63</th><th>feature_64</th><th>feature_65</th><th>feature_66</th><th>feature_67</th><th>feature_68</th><th>feature_69</th><th>feature_70</th><th>feature_71</th><th>feature_72</th><th>feature_73</th><th>feature_74</th><th>feature_75</th><th>feature_76</th><th>feature_77</th><th>feature_78</th><th>responder_0</th><th>responder_1</th><th>responder_2</th><th>responder_3</th><th>responder_4</th><th>responder_5</th><th>responder_6</th><th>responder_7</th><th>responder_8</th><th>partition_id</th><th>label</th><th>responder_0_lag_1</th><th>responder_1_lag_1</th><th>responder_2_lag_1</th><th>responder_3_lag_1</th><th>responder_4_lag_1</th><th>responder_5_lag_1</th><th>responder_6_lag_1</th><th>responder_7_lag_1</th><th>responder_8_lag_1</th></tr><tr><td>u32</td><td>i16</td><td>i16</td><td>i8</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>i8</td><td>i8</td><td>i16</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>&hellip;</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>i64</td><td>i32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td><td>f32</td></tr></thead><tbody><tr><td>25023058</td><td>1101</td><td>0</td><td>0</td><td>1.913215</td><td>0.458568</td><td>-0.05264</td><td>-0.044876</td><td>0.124223</td><td>2.819707</td><td>-0.746395</td><td>0.270162</td><td>0.232489</td><td>0.638483</td><td>11</td><td>7</td><td>76</td><td>-0.859027</td><td>0.695877</td><td>-0.356197</td><td>null</td><td>0.300569</td><td>null</td><td>-1.081869</td><td>-1.249594</td><td>0.586737</td><td>-0.283532</td><td>0.351779</td><td>1.07356</td><td>-0.974062</td><td>-0.908026</td><td>0.737549</td><td>0.87567</td><td>0.616378</td><td>0.052371</td><td>0.482981</td><td>-0.269024</td><td>&hellip;</td><td>-0.140479</td><td>0.042491</td><td>-0.028724</td><td>-1.427209</td><td>-1.99307</td><td>-0.862814</td><td>1.568264</td><td>-0.094396</td><td>-0.809437</td><td>-0.145835</td><td>-0.684791</td><td>null</td><td>null</td><td>-0.122062</td><td>-0.378493</td><td>-0.36432</td><td>-0.260619</td><td>0.108411</td><td>-0.189889</td><td>0.095152</td><td>1.188086</td><td>0.183916</td><td>-0.569924</td><td>1.233719</td><td>0.429217</td><td>-0.708557</td><td>6</td><td>2</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25023059</td><td>1101</td><td>0</td><td>1</td><td>4.360143</td><td>0.111398</td><td>0.500473</td><td>0.083353</td><td>0.395555</td><td>2.468412</td><td>-0.706918</td><td>0.313437</td><td>0.172877</td><td>0.371777</td><td>11</td><td>7</td><td>76</td><td>-0.878114</td><td>1.199868</td><td>-0.304281</td><td>null</td><td>-0.151362</td><td>null</td><td>-1.775065</td><td>-1.312861</td><td>0.16722</td><td>0.034493</td><td>2.383581</td><td>1.70292</td><td>-0.74334</td><td>-0.219267</td><td>0.377675</td><td>1.223783</td><td>1.276546</td><td>-0.343797</td><td>-0.154821</td><td>0.051061</td><td>&hellip;</td><td>-0.277945</td><td>-0.191327</td><td>-0.312494</td><td>-1.107761</td><td>-1.085603</td><td>-0.759455</td><td>1.070539</td><td>-0.126439</td><td>-1.20999</td><td>0.30999</td><td>-0.537283</td><td>null</td><td>null</td><td>-0.22374</td><td>-0.256861</td><td>-0.288086</td><td>-0.323778</td><td>-0.155402</td><td>-0.154787</td><td>-0.243248</td><td>-0.497277</td><td>-0.25804</td><td>-0.358548</td><td>-0.582184</td><td>-0.333726</td><td>-0.26815</td><td>6</td><td>-1</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25023060</td><td>1101</td><td>0</td><td>2</td><td>1.259379</td><td>0.536855</td><td>0.309993</td><td>0.015098</td><td>0.318689</td><td>2.594687</td><td>-1.1574</td><td>0.48536</td><td>0.329561</td><td>0.671811</td><td>81</td><td>2</td><td>59</td><td>-1.163686</td><td>-0.307989</td><td>-0.858999</td><td>null</td><td>-0.30705</td><td>null</td><td>-1.227922</td><td>-1.326199</td><td>-1.473596</td><td>-0.266024</td><td>-0.474967</td><td>-0.199162</td><td>-1.760276</td><td>-1.485319</td><td>0.677112</td><td>1.269566</td><td>1.747018</td><td>-0.725915</td><td>-0.495244</td><td>-0.274749</td><td>&hellip;</td><td>-0.280476</td><td>-0.211912</td><td>-0.219207</td><td>-2.506536</td><td>-2.055502</td><td>-1.226109</td><td>-0.096572</td><td>-0.445255</td><td>-1.033872</td><td>-0.290695</td><td>-0.800315</td><td>null</td><td>null</td><td>-0.104352</td><td>-0.221018</td><td>-0.382566</td><td>-0.330158</td><td>-0.327308</td><td>-0.253688</td><td>-0.561014</td><td>-1.515344</td><td>1.91926</td><td>-3.469981</td><td>-1.465263</td><td>1.964456</td><td>-3.273642</td><td>6</td><td>-2</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25023061</td><td>1101</td><td>0</td><td>3</td><td>1.498643</td><td>-0.016845</td><td>-0.104391</td><td>-0.202445</td><td>0.404921</td><td>2.384175</td><td>-0.447801</td><td>0.22617</td><td>0.172059</td><td>0.363244</td><td>4</td><td>3</td><td>11</td><td>-0.915372</td><td>1.030181</td><td>-0.212352</td><td>null</td><td>-0.169328</td><td>null</td><td>-1.573598</td><td>-1.306565</td><td>-0.405128</td><td>0.050558</td><td>-0.176753</td><td>-0.542888</td><td>0.304873</td><td>1.171678</td><td>-0.502733</td><td>-1.08011</td><td>-0.591162</td><td>-0.527882</td><td>-0.743914</td><td>0.045586</td><td>&hellip;</td><td>-0.31175</td><td>-0.345839</td><td>-0.413218</td><td>-1.890556</td><td>-2.079406</td><td>-0.722361</td><td>0.424735</td><td>-0.28688</td><td>-0.814299</td><td>1.873171</td><td>-0.061714</td><td>null</td><td>null</td><td>1.16344</td><td>1.1204</td><td>0.125606</td><td>0.188438</td><td>-0.002188</td><td>-0.102668</td><td>-0.763048</td><td>-0.654262</td><td>-1.305771</td><td>-0.187887</td><td>-0.793223</td><td>-1.376819</td><td>0.20175</td><td>6</td><td>-1</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25023062</td><td>1101</td><td>0</td><td>4</td><td>1.013641</td><td>0.269194</td><td>-0.088913</td><td>-0.436358</td><td>-0.025382</td><td>2.440446</td><td>-0.57961</td><td>0.207809</td><td>0.140545</td><td>0.341923</td><td>15</td><td>1</td><td>9</td><td>-1.1123</td><td>0.355613</td><td>-0.510269</td><td>null</td><td>-0.374868</td><td>null</td><td>-1.360212</td><td>-1.567855</td><td>1.298702</td><td>-0.087483</td><td>-0.72015</td><td>-0.582005</td><td>-0.284471</td><td>0.609314</td><td>-1.606182</td><td>-1.231077</td><td>-0.251321</td><td>-0.552514</td><td>-0.45447</td><td>-0.085228</td><td>&hellip;</td><td>-0.12504</td><td>-0.133995</td><td>-0.14408</td><td>-1.557398</td><td>-1.912102</td><td>-0.894412</td><td>0.344008</td><td>-0.377989</td><td>-1.108163</td><td>0.061968</td><td>-0.652792</td><td>null</td><td>null</td><td>0.007712</td><td>0.001405</td><td>-0.245694</td><td>-0.162255</td><td>-0.042635</td><td>-0.071551</td><td>-0.114196</td><td>-0.278691</td><td>-0.149025</td><td>-0.66197</td><td>-0.257424</td><td>-0.088133</td><td>-1.544584</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td><td>&hellip;</td></tr><tr><td>25060805</td><td>1101</td><td>967</td><td>34</td><td>1.38958</td><td>-0.7028</td><td>-0.977729</td><td>-0.330834</td><td>-0.704871</td><td>-1.041493</td><td>0.174243</td><td>1.454852</td><td>-0.32982</td><td>-1.294859</td><td>42</td><td>5</td><td>150</td><td>-0.150457</td><td>0.521319</td><td>-0.086012</td><td>-0.754335</td><td>-0.279344</td><td>-0.598974</td><td>0.057134</td><td>0.957063</td><td>0.115745</td><td>-0.209302</td><td>0.178385</td><td>-0.401783</td><td>-0.60871</td><td>-0.560061</td><td>0.051171</td><td>1.543215</td><td>1.624583</td><td>-0.700015</td><td>-0.516634</td><td>-0.227234</td><td>&hellip;</td><td>-0.408149</td><td>-0.281938</td><td>-0.31932</td><td>-0.806948</td><td>0.775138</td><td>-0.20356</td><td>0.803099</td><td>-0.030201</td><td>-0.055284</td><td>0.110207</td><td>-0.164637</td><td>-0.323066</td><td>-0.356105</td><td>-0.3175</td><td>-0.273421</td><td>-0.383094</td><td>-0.320388</td><td>0.312874</td><td>0.231182</td><td>0.113768</td><td>-0.047135</td><td>-0.024395</td><td>-0.167026</td><td>-0.320777</td><td>-0.109656</td><td>-0.726807</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25060806</td><td>1101</td><td>967</td><td>35</td><td>0.943952</td><td>-0.324261</td><td>-0.151253</td><td>0.026357</td><td>-0.119514</td><td>-1.182524</td><td>0.159828</td><td>0.881722</td><td>-0.332037</td><td>-0.931292</td><td>11</td><td>7</td><td>76</td><td>-0.55896</td><td>-0.459197</td><td>-0.411643</td><td>3.958932</td><td>4.155701</td><td>2.940465</td><td>3.910137</td><td>0.49823</td><td>0.749494</td><td>0.014894</td><td>-0.430784</td><td>1.178271</td><td>-0.59572</td><td>-0.073092</td><td>0.091872</td><td>-1.962563</td><td>-2.290511</td><td>3.420314</td><td>4.89368</td><td>0.014831</td><td>&hellip;</td><td>0.550101</td><td>1.594744</td><td>0.921203</td><td>0.35961</td><td>3.119171</td><td>-0.865203</td><td>-0.315087</td><td>-0.395001</td><td>-0.343131</td><td>-0.42275</td><td>-0.220564</td><td>-0.342992</td><td>-0.476394</td><td>-0.187197</td><td>-0.265712</td><td>-0.288886</td><td>-0.12437</td><td>-1.42063</td><td>0.262246</td><td>1.463928</td><td>-0.162056</td><td>-0.098624</td><td>-0.505561</td><td>-0.093831</td><td>-0.027931</td><td>-0.14261</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25060807</td><td>1101</td><td>967</td><td>36</td><td>1.302444</td><td>-0.22352</td><td>-0.513127</td><td>-0.598366</td><td>-0.185704</td><td>-0.910259</td><td>0.175318</td><td>1.495476</td><td>-0.608952</td><td>-1.360056</td><td>68</td><td>6</td><td>388</td><td>1.08706</td><td>2.219226</td><td>2.252061</td><td>1.981443</td><td>0.86858</td><td>1.351121</td><td>4.994243</td><td>1.117165</td><td>-0.540634</td><td>-0.039285</td><td>-0.533067</td><td>1.04184</td><td>-1.058485</td><td>-0.606737</td><td>-0.373143</td><td>-0.924465</td><td>-0.880157</td><td>1.106346</td><td>1.169852</td><td>-0.045873</td><td>&hellip;</td><td>-0.089151</td><td>-0.461169</td><td>-0.083253</td><td>3.607711</td><td>1.14511</td><td>1.169405</td><td>0.828673</td><td>2.751653</td><td>0.731948</td><td>3.580747</td><td>2.642683</td><td>-0.33627</td><td>-0.328574</td><td>-0.182743</td><td>-0.284014</td><td>-0.274022</td><td>-0.296241</td><td>0.647421</td><td>0.061193</td><td>-2.473481</td><td>-0.037256</td><td>-0.03256</td><td>-0.215104</td><td>-0.160578</td><td>-0.056753</td><td>-0.444496</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25060808</td><td>1101</td><td>967</td><td>37</td><td>0.842202</td><td>-0.848737</td><td>-0.869901</td><td>-0.057307</td><td>-0.397627</td><td>-1.259322</td><td>0.133388</td><td>1.299565</td><td>-0.308106</td><td>-1.363458</td><td>34</td><td>4</td><td>214</td><td>0.45396</td><td>0.263169</td><td>0.761553</td><td>-0.577716</td><td>-0.201275</td><td>-0.344857</td><td>-0.280034</td><td>-1.454184</td><td>-0.917644</td><td>-0.226854</td><td>-0.984756</td><td>-0.925856</td><td>-0.419104</td><td>-0.123074</td><td>-0.083158</td><td>-1.307634</td><td>-1.015463</td><td>-0.893838</td><td>-0.454903</td><td>-0.167192</td><td>&hellip;</td><td>-0.506533</td><td>-0.253573</td><td>-0.299359</td><td>0.610885</td><td>-2.19654</td><td>0.533447</td><td>0.339038</td><td>0.858602</td><td>0.504508</td><td>0.449486</td><td>0.267561</td><td>-0.198038</td><td>-0.174703</td><td>0.762484</td><td>0.877354</td><td>-0.114946</td><td>-0.174437</td><td>0.267422</td><td>0.279815</td><td>2.947578</td><td>-0.052169</td><td>-0.052995</td><td>0.194105</td><td>-1.268683</td><td>-0.345363</td><td>-1.616249</td><td>6</td><td>-2</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr><tr><td>25060809</td><td>1101</td><td>967</td><td>38</td><td>2.708526</td><td>-0.093785</td><td>-0.530218</td><td>0.011678</td><td>-0.364933</td><td>-1.078341</td><td>0.170624</td><td>0.860342</td><td>-0.261375</td><td>-0.981406</td><td>50</td><td>1</td><td>522</td><td>-0.223665</td><td>0.59994</td><td>0.222349</td><td>-0.330523</td><td>-0.627451</td><td>-0.702775</td><td>-0.006032</td><td>3.764182</td><td>0.49505</td><td>-0.208255</td><td>1.256033</td><td>-0.064132</td><td>-0.341035</td><td>0.57118</td><td>-0.429243</td><td>1.769033</td><td>1.465759</td><td>-0.847868</td><td>-0.723185</td><td>-0.200539</td><td>&hellip;</td><td>-0.413483</td><td>-0.263005</td><td>-0.424876</td><td>-0.932489</td><td>3.66088</td><td>-0.197272</td><td>0.680031</td><td>0.237876</td><td>-0.143687</td><td>0.017006</td><td>0.087483</td><td>-0.272279</td><td>-0.212697</td><td>0.240631</td><td>0.31096</td><td>-0.101432</td><td>-0.060634</td><td>-0.174811</td><td>-0.007507</td><td>-0.64436</td><td>0.287852</td><td>0.174577</td><td>-0.014433</td><td>-0.166157</td><td>-0.04831</td><td>-0.220142</td><td>6</td><td>0</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td><td>null</td></tr></tbody></table></div>"
+      ],
+      "text/plain": [
+       "shape: (37_752, 104)\n",
+       "┌──────────┬─────────┬─────────┬───────────┬───┬────────────┬────────────┬────────────┬────────────┐\n",
+       "│ id       ┆ date_id ┆ time_id ┆ symbol_id ┆ … ┆ responder_ ┆ responder_ ┆ responder_ ┆ responder_ │\n",
+       "│ ---      ┆ ---     ┆ ---     ┆ ---       ┆   ┆ 5_lag_1    ┆ 6_lag_1    ┆ 7_lag_1    ┆ 8_lag_1    │\n",
+       "│ u32      ┆ i16     ┆ i16     ┆ i8        ┆   ┆ ---        ┆ ---        ┆ ---        ┆ ---        │\n",
+       "│          ┆         ┆         ┆           ┆   ┆ f32        ┆ f32        ┆ f32        ┆ f32        │\n",
+       "╞══════════╪═════════╪═════════╪═══════════╪═══╪════════════╪════════════╪════════════╪════════════╡\n",
+       "│ 25023058 ┆ 1101    ┆ 0       ┆ 0         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ 25023059 ┆ 1101    ┆ 0       ┆ 1         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ 25023060 ┆ 1101    ┆ 0       ┆ 2         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ 25023061 ┆ 1101    ┆ 0       ┆ 3         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ 25023062 ┆ 1101    ┆ 0       ┆ 4         ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ …        ┆ …       ┆ …       ┆ …         ┆ … ┆ …          ┆ …          ┆ …          ┆ …          │\n",
+       "│ 25060805 ┆ 1101    ┆ 967     ┆ 34        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ 25060806 ┆ 1101    ┆ 967     ┆ 35        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ 25060807 ┆ 1101    ┆ 967     ┆ 36        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ 25060808 ┆ 1101    ┆ 967     ┆ 37        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "│ 25060809 ┆ 1101    ┆ 967     ┆ 38        ┆ … ┆ null       ┆ null       ┆ null       ┆ null       │\n",
+       "└──────────┴─────────┴─────────┴───────────┴───┴────────────┴────────────┴────────────┴────────────┘"
+      ]
+     },
+     "execution_count": 9,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "pl.read_parquet(\"/kaggle/working/training.parquet/date_id=1101/00000000.parquet\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "id": "97a50164",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-12-22T17:32:08.454918Z",
+     "iopub.status.busy": "2024-12-22T17:32:08.453957Z",
+     "iopub.status.idle": "2024-12-22T17:33:02.297966Z",
+     "shell.execute_reply": "2024-12-22T17:33:02.296423Z"
+    },
+    "papermill": {
+     "duration": 53.853951,
+     "end_time": "2024-12-22T17:33:02.300911",
+     "exception": false,
+     "start_time": "2024-12-22T17:32:08.446960",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "validation_data.collect().\\\n",
+    "write_parquet(\n",
+    "    \"validation.parquet\", partition_by = \"date_id\",\n",
+    ")"
+   ]
+  }
+ ],
+ "metadata": {
+  "kaggle": {
+   "accelerator": "none",
+   "dataSources": [
+    {
+     "databundleVersionId": 9871156,
+     "sourceId": 84493,
+     "sourceType": "competition"
+    }
+   ],
+   "dockerImageVersionId": 30786,
+   "isGpuEnabled": false,
+   "isInternetEnabled": true,
+   "language": "python",
+   "sourceType": "notebook"
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.14"
+  },
+  "papermill": {
+   "default_parameters": {},
+   "duration": 183.149425,
+   "end_time": "2024-12-22T17:33:06.143518",
+   "environment_variables": {},
+   "exception": null,
+   "input_path": "__notebook__.ipynb",
+   "output_path": "__notebook__.ipynb",
+   "parameters": {},
+   "start_time": "2024-12-22T17:30:02.994093",
+   "version": "2.6.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
